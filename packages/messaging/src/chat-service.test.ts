@@ -1,0 +1,84 @@
+import { describe, expect, it } from "vitest";
+import { DatabaseContext, SqliteConnection } from "@lockal/database";
+import { deviceId, isoNow, organizationId, userId } from "@lockal/shared";
+import { ChatService, directChatId } from "./chat-service.js";
+
+async function createDb() {
+  return new DatabaseContext(await SqliteConnection.open(true));
+}
+
+describe("ChatService.ensureChatFromDirectId", () => {
+  it("recovers both participant ids from a dm_<userA>_<userB> chat id", async () => {
+    // Regression test: user ids look like `usr_<body>` — a naive split("_")
+    // on the combined chat id shatters into 4 parts instead of 2, silently
+    // no-op'ing chat creation on the receiving device.
+    const db = await createDb();
+    const chat = new ChatService(db);
+    const orgId = organizationId();
+    const alice = userId();
+    const bob = userId();
+    const chatId = directChatId(alice, bob);
+
+    expect(db.connection.get("SELECT id FROM chats WHERE id = ?", [chatId])).toBeNull();
+
+    chat.ensureChatFromDirectId(orgId, chatId);
+
+    expect(db.connection.get("SELECT id FROM chats WHERE id = ?", [chatId])).not.toBeNull();
+    const members = db.connection.all<{ user_id: string }>(
+      "SELECT user_id FROM chat_members WHERE chat_id = ?",
+      [chatId],
+    );
+    expect(members.map((m) => m.user_id).sort()).toEqual([alice, bob].sort());
+  });
+
+  it("is a no-op if the chat already exists", async () => {
+    const db = await createDb();
+    const chat = new ChatService(db);
+    const orgId = organizationId();
+    const alice = userId();
+    const bob = userId();
+    const chatId = chat.ensureDirectChat(orgId, alice, bob);
+
+    // Should not throw or duplicate members when called again via the id path.
+    chat.ensureChatFromDirectId(orgId, chatId);
+    const members = db.connection.all("SELECT user_id FROM chat_members WHERE chat_id = ?", [chatId]);
+    expect(members.length).toBe(2);
+  });
+
+  it("ignores malformed ids instead of throwing", async () => {
+    const db = await createDb();
+    const chat = new ChatService(db);
+    expect(() => chat.ensureChatFromDirectId(organizationId(), "not-a-real-id" as never)).not.toThrow();
+    const now = isoNow();
+    void now;
+  });
+});
+
+describe("ChatService unread / markChatRead", () => {
+  it("counts incoming messages as unread until the viewer marks the chat read", async () => {
+    const db = await createDb();
+    const chat = new ChatService(db);
+    const orgId = organizationId();
+    const alice = userId();
+    const bob = userId();
+    const chatId = chat.ensureDirectChat(orgId, alice, bob);
+
+    chat.sendTextMessage({
+      chatId,
+      sender: { id: alice } as never,
+      senderDeviceId: deviceId(),
+      text: "привет",
+    });
+
+    const bobList = chat.listDirectChatsForUser(bob);
+    expect(bobList[0]?.unreadCount).toBe(1);
+    expect(chat.listDirectChatsForUser(alice)[0]?.unreadCount).toBe(0);
+
+    const unread = chat.markChatRead(chatId, bob);
+    expect(unread).toHaveLength(1);
+    expect(unread[0]?.contentText).toBe("привет");
+    expect(chat.listDirectChatsForUser(bob)[0]?.unreadCount).toBe(0);
+    expect(chat.listDirectChatsForUser(alice)[0]?.lastMessageSenderUserId).toBe(alice);
+    expect(chat.markChatRead(chatId, bob)).toHaveLength(0);
+  });
+});

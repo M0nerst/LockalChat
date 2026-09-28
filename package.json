@@ -1,0 +1,35 @@
+{
+  "name": "lockalchat",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local-first corporate messenger (P2P / LAN)",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @lockal/shared && npm run build -w @lockal/domain && npm run build -w @lockal/crypto && npm run build -w @lockal/permissions && npm run build -w @lockal/database && npm run build -w @lockal/messaging && npm run build -w @lockal/networking && npm run build -w @lockal/file-transfer && npm run build -w @lockal/sync && npm run build -w @lockal/application && npm run build -w @lockal/ui && npm run build -w @lockal/desktop",
+    "build:rust": "cargo build --release -p lockal-daemon",
+    "dev:daemon": "cargo run -p lockal-daemon -- --config daemon-config.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint \"packages/**/*.{ts,tsx}\" \"apps/**/*.{ts,tsx}\"",
+    "typecheck": "npm run typecheck -w @lockal/shared -w @lockal/domain -w @lockal/crypto -w @lockal/permissions -w @lockal/database -w @lockal/application -w @lockal/ui -w @lockal/desktop",
+    "dev": "npm run dev -w @lockal/desktop",
+    "start": "npm run dev -w @lockal/desktop",
+    "format": "prettier --write \"**/*.{ts,tsx,json,md}\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "eslint": "^9.16.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

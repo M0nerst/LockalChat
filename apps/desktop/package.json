@@ -1,0 +1,36 @@
+{
+  "name": "@lockal/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "predev": "node scripts/copy-sql-wasm.mjs",
+    "dev": "vite",
+    "prebuild": "node scripts/copy-sql-wasm.mjs",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "prepare:sidecar": "powershell -ExecutionPolicy Bypass -File ./scripts/prepare-sidecar.ps1"
+  },
+  "dependencies": {
+    "@lockal/application": "*",
+    "@lockal/domain": "*",
+    "@lockal/messaging": "*",
+    "@lockal/ui": "*",
+    "@tauri-apps/api": "^2.2.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-i18next": "^15.4.0",
+    "react-router-dom": "^7.1.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.2.0",
+    "@types/react": "^19.0.1",
+    "@types/react-dom": "^19.0.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.3"
+  }
+}

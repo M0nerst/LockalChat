@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+*.db
+*.sqlite
+.env
+.env.*
+coverage/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/bin/*.exe
+crates/**/target/
+/target/
+.turbo/
+.lockal/
+daemon-config.json
+*.pdb
