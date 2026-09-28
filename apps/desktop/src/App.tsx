@@ -8,7 +8,6 @@ import { MessengerPage } from "./pages/MessengerPage.js";
 import { AdminPage } from "./pages/AdminPage.js";
 import { ContactsPage } from "./pages/ContactsPage.js";
 import { SettingsPage } from "./pages/SettingsPage.js";
-import { NetworkStatusBar } from "./components/NetworkStatusBar.js";
 
 function BootGate({ children }: { children: React.ReactNode }) {
   const { ready } = useApp();
@@ -30,7 +29,6 @@ export function App() {
         <BrowserRouter>
           <BootGate>
             <div className="app-viewport">
-              <NetworkStatusBar />
               <div className="route-viewport">
                 <Routes>
                   <Route path="/" element={<RootRedirect />} />
@@ -40,6 +38,7 @@ export function App() {
                   <Route path="/app" element={<MessengerPage />} />
                   <Route path="/contacts" element={<ContactsPage />} />
                   <Route path="/chat/:userId" element={<MessengerPage />} />
+              <Route path="/group/:groupId" element={<MessengerPage />} />
                   <Route path="/admin" element={<AdminPage />} />
                   <Route path="/settings" element={<SettingsPage />} />
                 </Routes>

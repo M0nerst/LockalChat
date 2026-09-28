@@ -27,26 +27,17 @@ export function NetworkStatusBar() {
 
   if (!auth) return null;
 
-  const daemonLabel =
-    daemonOk === null ? "сеть: проверка…" : daemonOk ? "сервис LAN: работает" : "сервис LAN: нет связи";
+  const dotClass = daemonOk === null ? "" : daemonOk ? "ok" : "down";
+  const label =
+    daemonOk === null ? "Сеть: проверка…" : daemonOk ? `LAN · ${connected} из ${peers}` : "Нет связи с LAN";
+  const title = import.meta.env.DEV
+    ? "В режиме разработки служба LAN стартует при входе"
+    : "Локальная сеть между устройствами организации";
 
   return (
-    <div
-      style={{
-        fontSize: 13,
-        color: "var(--muted)",
-        padding: "8px 12px",
-        borderBottom: "1px solid var(--border)",
-        background: "var(--surface)",
-        textAlign: "center",
-      }}
-    >
-      {daemonLabel} · устройств в LAN: {peers} · P2P-сессий: {connected}
-      {import.meta.env.DEV && (
-        <span style={{ marginLeft: 8 }}>
-          (daemon запускается автоматически при входе — отдельный терминал не нужен)
-        </span>
-      )}
+    <div className="lan-status" title={title}>
+      <span className={`lan-dot ${dotClass}`} />
+      <span>{label}</span>
     </div>
   );
 }

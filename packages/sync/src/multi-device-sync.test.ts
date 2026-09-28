@@ -116,7 +116,7 @@ async function createThreeDevicePair() {
   engineA2.start();
   engineB1.start();
 
-  return { dbA1, dbA2, dbB1, orgId, alice, bob, devA1, engineA1, engineA2, engineB1 };
+  return { dbA1, dbA2, dbB1, orgId, alice, bob, devA1, engineA1, engineA2, engineB1, transportA1 };
 }
 
 describe("Multi-device sync", () => {
@@ -229,5 +229,119 @@ describe("Multi-device sync", () => {
     expect(new ChatService(dbB1).listDirectChatsForUser(bob).find((c) => c.chatId === chatId)?.unreadCount).toBe(0);
     const aliceCopy = new ChatService(dbA1).listMessages(chatId).find((m) => m.id === msg.id);
     expect(aliceCopy?.status).toBe(MessageDeliveryStatus.Read);
+  });
+
+  it("materialises a group on the peer from the message payload alone", async () => {
+    const { dbA1, dbB1, orgId, alice, bob, devA1, engineA1, engineB1 } = await createThreeDevicePair();
+    const chats = new ChatService(dbA1);
+    const groupId = chats.createGroupChat({
+      organizationId: orgId,
+      creatorId: alice,
+      title: "Отдел",
+      memberUserIds: [bob],
+    });
+    const msg = chats.sendTextMessage({
+      chatId: groupId,
+      sender: dbA1.users.findById(alice)!,
+      senderDeviceId: devA1,
+      text: "всем привет",
+    });
+    await engineA1.publishChatMessage({
+      id: msg.id,
+      chatId: msg.chatId,
+      senderUserId: msg.senderUserId,
+      content: msg.contentText,
+      clientNonce: msg.clientNonce,
+      createdAt: msg.createdAt,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+
+    const bobChat = new ChatService(dbB1).getChat(groupId);
+    expect(bobChat?.kind).toBe("group");
+    expect(bobChat?.title).toBe("Отдел");
+    expect(new ChatService(dbB1).listMessages(groupId).map((m) => m.contentText)).toContain("всем привет");
+
+    const unread = new ChatService(dbB1).markChatRead(groupId, bob);
+    await engineB1.publishReadReceipts(unread);
+    await new Promise((r) => setTimeout(r, 40));
+    const aliceCopy = new ChatService(dbA1).listMessages(groupId).find((m) => m.id === msg.id);
+    expect(aliceCopy?.status).toBe(MessageDeliveryStatus.Delivered);
+  });
+
+  it("delivers a group roster after the sender was offline", async () => {
+    const { dbA1, dbB1, orgId, alice, bob, engineA1, transportA1 } = await createThreeDevicePair();
+    const groupId = new ChatService(dbA1).createGroupChat({
+      organizationId: orgId,
+      creatorId: alice,
+      title: "Склад",
+      memberUserIds: [bob],
+    });
+    transportA1.setOnline(false);
+    await engineA1.publishGroupChat(groupId);
+    expect(new ChatService(dbB1).getChat(groupId)).toBeNull();
+
+    transportA1.setOnline(true);
+    await (engineA1 as unknown as { flushOutbox(): Promise<void> }).flushOutbox();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(new ChatService(dbB1).getChat(groupId)?.title).toBe("Склад");
+  });
+
+  it("keeps a delivered message delivered when another device's retry is exhausted", async () => {
+    const { dbA1, orgId, alice, bob, devA1, engineA1 } = await createThreeDevicePair();
+    const chatId = new ChatService(dbA1).ensureDirectChat(orgId, alice, bob);
+    const msg = new ChatService(dbA1).sendTextMessage({
+      chatId,
+      sender: dbA1.users.findById(alice)!,
+      senderDeviceId: devA1,
+      text: "уже дошло",
+    });
+    await engineA1.publishChatMessage({
+      id: msg.id,
+      chatId: msg.chatId,
+      senderUserId: msg.senderUserId,
+      content: msg.contentText,
+      clientNonce: msg.clientNonce,
+      createdAt: msg.createdAt,
+      recipientUserId: bob,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    const now = new Date().toISOString();
+    dbA1.connection.exec(
+      `INSERT INTO message_outbox (id, message_id, target_device_id, envelope_json, attempts, next_retry_at, status, created_at)
+       VALUES (?, ?, ?, '{}', 8, ?, 'pending', ?)`,
+      ["obx_exhausted", msg.id, "dev_offline", now, now],
+    );
+    await (engineA1 as unknown as { flushOutbox(): Promise<void> }).flushOutbox();
+    const status = new ChatService(dbA1).listMessages(chatId).find((m) => m.id === msg.id)?.status;
+    expect(status === MessageDeliveryStatus.Sent || status === MessageDeliveryStatus.Delivered).toBe(true);
+  });
+
+  it("marks a queued message sent once the peer comes back", async () => {
+    const { dbA1, orgId, alice, bob, devA1, engineA1, transportA1 } = await createThreeDevicePair();
+    const chatId = new ChatService(dbA1).ensureDirectChat(orgId, alice, bob);
+    const msg = new ChatService(dbA1).sendTextMessage({
+      chatId,
+      sender: dbA1.users.findById(alice)!,
+      senderDeviceId: devA1,
+      text: "дождусь сети",
+    });
+    transportA1.setOnline(false);
+    await engineA1.publishChatMessage({
+      id: msg.id,
+      chatId: msg.chatId,
+      senderUserId: msg.senderUserId,
+      content: msg.contentText,
+      clientNonce: msg.clientNonce,
+      createdAt: msg.createdAt,
+      recipientUserId: bob,
+    });
+    expect(new ChatService(dbA1).listMessages(chatId).find((m) => m.id === msg.id)?.status).toBe(
+      MessageDeliveryStatus.Sending,
+    );
+    transportA1.setOnline(true);
+    await (engineA1 as unknown as { flushOutbox(): Promise<void> }).flushOutbox();
+    await new Promise((r) => setTimeout(r, 40));
+    const status = new ChatService(dbA1).listMessages(chatId).find((m) => m.id === msg.id)?.status;
+    expect(status === MessageDeliveryStatus.Sent || status === MessageDeliveryStatus.Delivered).toBe(true);
   });
 });

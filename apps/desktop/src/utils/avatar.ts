@@ -9,7 +9,7 @@ export function initials(name: string): string {
 
 // A calm, muted palette (no saturated/neon colors) so avatars stay
 // consistent with the app's overall "спокойные тона" design direction.
-const PALETTE = [
+export const AVATAR_PALETTE = [
   "#b3785c",
   "#7a9569",
   "#5c8ea3",
@@ -25,5 +25,10 @@ const PALETTE = [
 export function avatarColor(id: string): string {
   let hash = 0;
   for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
-  return PALETTE[hash % PALETTE.length]!;
+  return AVATAR_PALETTE[hash % AVATAR_PALETTE.length]!;
+}
+
+export function avatarBackground(id: string, avatarUrl?: string | null): string {
+  if (avatarUrl?.startsWith("color:")) return avatarUrl.slice("color:".length);
+  return avatarColor(id);
 }

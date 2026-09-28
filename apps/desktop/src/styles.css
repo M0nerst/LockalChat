@@ -1,28 +1,36 @@
 :root,
 [data-theme="light"] {
-  --bg: #f6f5f1;
-  --surface: #ffffff;
-  --surface-muted: #efece5;
-  --text: #2e2d2a;
+  --bg: #f3f1ec;
+  --surface: #fffcf8;
+  --surface-muted: #efece6;
+  --text: #2c2b28;
   --muted: #8a8478;
-  --primary: #5c6f78;
-  --primary-hover: #4b5c64;
-  --border: #e6e2d9;
-  --danger: #b5473d;
-  --shadow: rgba(46, 45, 42, 0.06);
+  --primary: #5d6f66;
+  --primary-hover: #4c5c55;
+  --accent-soft: #e6eee9;
+  --bubble: #fffcf8;
+  --bubble-own: #e4eee8;
+  --border: #e4e0d8;
+  --danger: #a8544c;
+  --online: #6d9a78;
+  --shadow: rgba(44, 43, 40, 0.05);
 }
 
 [data-theme="dark"] {
-  --bg: #1c1e1e;
-  --surface: #262929;
-  --surface-muted: #2f3232;
-  --text: #eae7e0;
+  --bg: #1a1c1c;
+  --surface: #242726;
+  --surface-muted: #2c302f;
+  --text: #e8e6e1;
   --muted: #9a958c;
-  --primary: #8ba7ac;
-  --primary-hover: #a2bbbf;
-  --border: #3a3d3c;
-  --danger: #cf7b70;
-  --shadow: rgba(0, 0, 0, 0.25);
+  --primary: #8eaea4;
+  --primary-hover: #a4c0b7;
+  --accent-soft: #2c3834;
+  --bubble: #242726;
+  --bubble-own: #31403b;
+  --border: #3a3e3c;
+  --danger: #d08a82;
+  --online: #7eae8a;
+  --shadow: rgba(0, 0, 0, 0.28);
 }
 
 * {
@@ -40,6 +48,13 @@ body {
   font-family: "Segoe UI", system-ui, sans-serif;
   background: var(--bg);
   color: var(--text);
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
 
 /* Wraps <NetworkStatusBar/> + the routed page: fixed to the viewport height
@@ -64,43 +79,108 @@ body {
   height: 100%;
   min-height: 0;
   display: grid;
-  grid-template-columns: 240px 1fr;
+  grid-template-columns: 248px 1fr;
   overflow: hidden;
 }
 
 .sidebar {
   background: var(--surface);
   border-right: 1px solid var(--border);
-  padding: 24px 16px;
-  text-align: center;
+  padding: 18px 12px 14px;
+  text-align: left;
   height: 100%;
   overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-}
-
-.sidebar nav {
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
-.sidebar-footer {
-  margin-top: auto;
-  padding-top: 20px;
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px 14px;
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: -0.02em;
 }
 
-/* Main nav items rendered as real buttons (not bare underlined links) —
-   full-width, rounded, with a hover/active state and a highlighted
-   background for whichever section is currently open. */
+.sidebar-brand img {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  object-fit: cover;
+}
+
+.sidebar-profile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  margin-bottom: 12px;
+  border-radius: 12px;
+  text-decoration: none;
+  color: inherit;
+}
+
+.sidebar-profile:hover {
+  background: var(--surface-muted);
+}
+
+.sidebar-profile-text {
+  min-width: 0;
+}
+
+.sidebar-profile-name {
+  font-weight: 600;
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-profile-org {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sidebar-footer .secondary {
+  width: 100%;
+}
+
 .nav-link {
-  display: block;
-  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
   border-radius: 10px;
   color: var(--text);
   text-decoration: none;
   font-weight: 500;
+  font-size: 14px;
   transition: background 0.15s ease, color 0.15s ease;
+}
+
+.nav-icon {
+  flex-shrink: 0;
+  opacity: 0.8;
 }
 
 .nav-link:hover {
@@ -108,8 +188,12 @@ body {
 }
 
 .nav-link.active {
-  background: var(--primary);
-  color: white;
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.nav-link.active .nav-icon {
+  opacity: 1;
 }
 
 /* Unified "← Back" link used at the top of every secondary page
@@ -151,6 +235,20 @@ body {
   height: 100%;
   overflow-y: auto;
   justify-content: flex-start;
+  align-items: flex-start;
+  padding: 28px 32px 40px;
+}
+
+.app-shell .main > h1,
+.app-shell .main > h2,
+.app-shell .main > h3 {
+  text-align: left;
+  margin: 0 0 16px;
+  font-size: 22px;
+}
+
+.app-shell .card {
+  max-width: 640px;
 }
 
 .main > h1,
@@ -230,7 +328,6 @@ button {
 
 button:hover {
   background: var(--primary-hover);
-  box-shadow: 0 2px 6px var(--shadow);
 }
 
 button:active {
@@ -368,7 +465,7 @@ button.secondary:active {
   height: 100%;
   overflow: hidden;
   display: grid;
-  grid-template-columns: 240px 300px 1fr;
+  grid-template-columns: 248px 320px 1fr;
 }
 
 .messenger-shell .sidebar {
@@ -386,7 +483,21 @@ button.secondary:active {
 }
 
 .chat-list-header {
-  padding: 20px 16px 12px;
+  padding: 18px 16px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.chat-list-header h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.chat-new-group {
+  padding: 6px 12px;
+  font-size: 13px;
 }
 
 .chat-search-wrap {
@@ -420,7 +531,9 @@ button.secondary:active {
   display: flex;
   gap: 12px;
   align-items: center;
-  padding: 10px 16px;
+  padding: 10px 12px;
+  margin: 0 8px;
+  border-radius: 10px;
   cursor: pointer;
   transition: background 0.12s ease;
 }
@@ -429,8 +542,9 @@ button.secondary:active {
   background: var(--surface-muted);
 }
 
-.chat-list-item.active {
-  background: var(--surface-muted);
+.chat-list-item.active,
+.chat-list-item.active:hover {
+  background: var(--accent-soft);
 }
 
 .chat-list-item-body {
@@ -502,13 +616,23 @@ button.secondary:active {
 .conversation-empty {
   flex: 1;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 14px;
   color: var(--muted);
   font-size: 15px;
   text-align: center;
   line-height: 1.7;
   padding: 24px;
+}
+
+.conversation-empty-logo {
+  width: 56px;
+  height: 56px;
+  border-radius: 16px;
+  object-fit: cover;
+  opacity: 0.9;
 }
 
 .conversation-header {
@@ -521,6 +645,11 @@ button.secondary:active {
   flex-shrink: 0;
 }
 
+.conversation-header > div {
+  min-width: 0;
+  flex: 1;
+}
+
 .conversation-header-name {
   font-weight: 600;
 }
@@ -528,6 +657,14 @@ button.secondary:active {
 .conversation-header-status {
   font-size: 12px;
   color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.load-earlier {
+  align-self: center;
+  margin-bottom: 8px;
 }
 
 .messages-area {
@@ -548,30 +685,114 @@ button.secondary:active {
 }
 
 .msg-bubble {
-  max-width: 62%;
+  max-width: min(62%, 520px);
   padding: 8px 12px 6px;
-  border-radius: 14px;
-  background: var(--surface);
-  box-shadow: 0 1px 2px var(--shadow);
-  font-size: 14px;
-  line-height: 1.42;
+  border-radius: 16px;
+  background: var(--bubble);
+  border: 1px solid var(--border);
+  font-size: 14.5px;
+  line-height: 1.45;
   word-break: break-word;
   white-space: pre-wrap;
 }
 
 .msg-row:not(.own) .msg-bubble {
-  border-bottom-left-radius: 4px;
+  border-bottom-left-radius: 5px;
 }
 
 .msg-row.own .msg-bubble {
-  background: var(--primary);
-  color: white;
-  border-bottom-right-radius: 4px;
+  background: var(--bubble-own);
+  color: var(--text);
+  border-color: transparent;
+  border-bottom-right-radius: 5px;
 }
 
 .msg-row.own .msg-bubble .file-attachment {
-  background: rgba(255, 255, 255, 0.15);
-  border-color: rgba(255, 255, 255, 0.25);
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.msg-sender {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 2px;
+  opacity: 0.85;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(46, 45, 42, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+  padding: 24px;
+}
+
+.modal-card {
+  max-width: 420px;
+  max-height: min(80vh, 640px);
+  overflow: auto;
+  text-align: left;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.group-member-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.group-member-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.group-member-row input {
+  width: auto;
+  margin: 0;
+}
+
+.color-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.color-swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  padding: 0;
+  box-shadow: none;
+  background: var(--swatch, var(--primary));
+}
+
+button.color-swatch:hover,
+button.color-swatch:active {
+  background: var(--swatch, var(--primary));
+  box-shadow: none;
+  transform: none;
+}
+
+.color-swatch.selected {
+  border-color: var(--text);
 }
 
 .msg-time {
@@ -589,7 +810,7 @@ button.secondary:active {
 
 .msg-status-failed,
 .msg-retry {
-  color: #ffd59a;
+  color: var(--danger);
 }
 
 .msg-retry {
@@ -614,10 +835,9 @@ button.secondary:active {
 .composer {
   display: flex;
   gap: 8px;
-  align-items: center;
-  padding: 12px 16px;
-  border-top: 1px solid var(--border);
-  background: var(--surface);
+  align-items: flex-end;
+  padding: 10px 16px 14px;
+  background: var(--bg);
   flex-shrink: 0;
 }
 
@@ -632,6 +852,9 @@ button.secondary:active {
   line-height: 1.4;
   resize: none;
   overflow-y: auto;
+  background: var(--surface);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
 }
 
 .composer-icon-btn {
@@ -686,7 +909,7 @@ button.secondary:active {
 }
 
 .avatar-status.online {
-  background: #6fa87a;
+  background: var(--online);
 }
 
 .avatar-status.offline {
@@ -714,6 +937,32 @@ button.secondary:active {
   height: 72px;
   border-radius: 18px;
   object-fit: cover;
+  border: 1px solid var(--border);
+}
+
+.lan-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.lan-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.lan-dot.ok {
+  background: var(--online);
+}
+
+.lan-dot.down {
+  background: var(--danger);
 }
 
 .auth-brand h1 {
@@ -738,6 +987,7 @@ button.secondary:active {
 .auth-switch .nav-link {
   flex: 1;
   text-align: center;
+  justify-content: center;
 }
 
 .auth-screen form {

@@ -163,4 +163,8 @@ export class NetworkService {
   getFileDownloadService(): FileDownloadService {
     return new FileDownloadService(this.db, createBlobStore());
   }
+
+  async syncDirectory(): Promise<void> {
+    await this.directory?.broadcastDirectory();
+  }
 }

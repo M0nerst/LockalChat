@@ -2,6 +2,7 @@ export const PROTOCOL_VERSION = 1 as const;
 
 export type MessageType =
   | "chat.message"
+  | "chat.group"
   | "chat.ack"
   | "chat.reaction"
   | "presence.update"

@@ -1,4 +1,4 @@
-import { hashPassword, serializePasswordHash } from "@lockal/crypto";
+import { hashPassword, parsePasswordHash, serializePasswordHash, verifyPassword } from "@lockal/crypto";
 import type { DatabaseContext } from "@lockal/database";
 import { AuditEventType, UserRole, UserStatus } from "@lockal/domain";
 import type { User } from "@lockal/domain";
@@ -103,5 +103,43 @@ export class UserAdminService {
       throw new PermissionError(PermissionAction.UserList);
     }
     return this.db.users.listByOrganization(organizationId);
+  }
+
+  /** The signed-in user edits their own display name, avatar color and password.
+   * Password change requires the current password. Directory sync picks the row
+   * up because `updated_at` moves forward. */
+  updateOwnProfile(
+    actor: User,
+    input: {
+      displayName: string;
+      avatarUrl: string | null;
+      currentPassword?: string;
+      newPassword?: string;
+    },
+  ): User {
+    const displayName = input.displayName.trim();
+    if (!displayName) throw new Error("Укажите имя");
+    const now = isoNow();
+    let passwordHash: string | undefined;
+    const nextPassword = input.newPassword?.trim() ?? "";
+    if (nextPassword.length > 0) {
+      if (nextPassword.length < 4) throw new Error("Новый пароль должен быть не короче 4 символов");
+      if (!input.currentPassword) throw new Error("Введите текущий пароль");
+      const record = this.db.users.findByUsername(actor.organizationId, actor.username);
+      if (!record) throw new Error("Пользователь не найден");
+      if (!verifyPassword(input.currentPassword, parsePasswordHash(record.passwordHash))) {
+        throw new Error("Текущий пароль неверный");
+      }
+      passwordHash = serializePasswordHash(hashPassword(nextPassword));
+    }
+    this.db.users.updateProfile(actor.id, {
+      displayName,
+      avatarUrl: input.avatarUrl,
+      passwordHash,
+      updatedAt: now,
+    });
+    const updated = this.db.users.findById(actor.id);
+    if (!updated) throw new Error("Пользователь не найден");
+    return updated;
   }
 }

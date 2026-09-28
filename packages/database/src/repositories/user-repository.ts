@@ -86,4 +86,21 @@ export class UserRepository {
   updateStatus(id: UserId, status: UserStatus, updatedAt: string): void {
     this.db.exec("UPDATE users SET status = ?, updated_at = ? WHERE id = ?", [status, updatedAt, id]);
   }
+
+  updateProfile(
+    id: UserId,
+    patch: { displayName: string; avatarUrl: string | null; passwordHash?: string; updatedAt: string },
+  ): void {
+    if (patch.passwordHash !== undefined) {
+      this.db.exec(
+        "UPDATE users SET display_name = ?, avatar_url = ?, password_hash = ?, updated_at = ? WHERE id = ?",
+        [patch.displayName, patch.avatarUrl, patch.passwordHash, patch.updatedAt, id],
+      );
+      return;
+    }
+    this.db.exec(
+      "UPDATE users SET display_name = ?, avatar_url = ?, updated_at = ? WHERE id = ?",
+      [patch.displayName, patch.avatarUrl, patch.updatedAt, id],
+    );
+  }
 }

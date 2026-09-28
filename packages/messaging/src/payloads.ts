@@ -6,6 +6,18 @@ export interface ChatMessagePayload {
   contentType: "text";
   clientNonce: string;
   sentAt: string;
+  /** Present on group messages so a peer who missed `chat.group` can still create the chat. */
+  group?: {
+    title: string;
+    memberUserIds: string[];
+  };
+}
+
+export interface GroupChatPayload {
+  chatId: string;
+  title: string;
+  memberUserIds: string[];
+  createdAt: string;
 }
 
 export interface ChatAckPayload {
@@ -22,6 +34,7 @@ export interface DirectoryUserSnapshot {
   role: string;
   status: string;
   passwordHash: string;
+  avatarUrl?: string | null;
   updatedAt: string;
 }
 

@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 export const MIGRATION_V1 = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -207,4 +207,19 @@ CREATE INDEX IF NOT EXISTS idx_known_peers_user ON known_peers(user_id);
 
 export const MIGRATION_V6 = `
 ALTER TABLE chat_members ADD COLUMN last_read_at TEXT;
+`;
+
+/** Envelopes that are not tied to a chat message (group roster announces). */
+export const MIGRATION_V7 = `
+CREATE TABLE IF NOT EXISTS sync_outbox (
+  id TEXT PRIMARY KEY,
+  target_device_id TEXT NOT NULL,
+  envelope_json TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_retry_at TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_outbox_status ON sync_outbox(status, next_retry_at);
 `;

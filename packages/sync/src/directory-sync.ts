@@ -29,6 +29,7 @@ export class DirectorySyncService {
           role: u.role,
           status: u.status,
           passwordHash: full.passwordHash,
+          avatarUrl: u.avatarUrl,
           updatedAt: u.updatedAt,
         };
       }),
@@ -70,9 +71,19 @@ export class DirectorySyncService {
       if (existing && existing.updatedAt >= u.updatedAt) continue;
       if (existing) {
         this.db.connection.exec(
-          `UPDATE users SET username = ?, display_name = ?, role = ?, status = ?, password_hash = ?, updated_at = ?
+          `UPDATE users SET username = ?, display_name = ?, role = ?, status = ?, password_hash = ?,
+           avatar_url = ?, updated_at = ?
            WHERE id = ?`,
-          [u.username, u.displayName, u.role, u.status, u.passwordHash, u.updatedAt, u.id],
+          [
+            u.username,
+            u.displayName,
+            u.role,
+            u.status,
+            u.passwordHash,
+            u.avatarUrl === undefined ? existing.avatarUrl : u.avatarUrl,
+            u.updatedAt,
+            u.id,
+          ],
         );
       } else {
         this.db.users.create({
@@ -84,7 +95,7 @@ export class DirectorySyncService {
           role: u.role as UserRole,
           status: u.status as UserStatus,
           departmentId: null,
-          avatarUrl: null,
+          avatarUrl: u.avatarUrl ?? null,
           presence: PresenceStatus.Offline,
           lastSeenAt: null,
           createdAt: u.updatedAt,

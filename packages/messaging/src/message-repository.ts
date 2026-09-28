@@ -86,11 +86,11 @@ export class MessageRepository {
     };
     const rows: Row[] = before
       ? this.db.connection.all<Row>(
-          "SELECT * FROM messages WHERE chat_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?",
+          "SELECT * FROM messages WHERE chat_id = ? AND created_at < ? ORDER BY created_at DESC, id DESC LIMIT ?",
           [chatId, before, limit],
         )
       : this.db.connection.all<Row>(
-          "SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?",
+          "SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
           [chatId, limit],
         );
     return rows.map((row) => ({
@@ -165,6 +165,84 @@ export class MessageRepository {
 
   markOutboxFailed(id: string): void {
     this.db.connection.exec("UPDATE message_outbox SET status = 'failed' WHERE id = ?", [id]);
+  }
+
+  enqueueSyncOutbox(targetDeviceId: string, envelopeJson: string): string {
+    const id = generateId("syn");
+    const now = isoNow();
+    this.db.connection.exec(
+      `INSERT INTO sync_outbox (id, target_device_id, envelope_json, attempts, next_retry_at, status, created_at)
+       VALUES (?, ?, ?, 0, ?, 'pending', ?)`,
+      [id, targetDeviceId, envelopeJson, now, now],
+    );
+    return id;
+  }
+
+  listPendingSyncOutbox(limit = 20): Array<{
+    id: string;
+    targetDeviceId: string;
+    envelopeJson: string;
+    attempts: number;
+  }> {
+    const now = isoNow();
+    return this.db.connection
+      .all<{
+        id: string;
+        target_device_id: string;
+        envelope_json: string;
+        attempts: number;
+      }>(
+        `SELECT id, target_device_id, envelope_json, attempts FROM sync_outbox
+         WHERE status = 'pending' AND next_retry_at <= ? ORDER BY created_at LIMIT ?`,
+        [now, limit],
+      )
+      .map((r) => ({
+        id: r.id,
+        targetDeviceId: r.target_device_id,
+        envelopeJson: r.envelope_json,
+        attempts: r.attempts,
+      }));
+  }
+
+  markSyncOutboxSent(id: string): void {
+    this.db.connection.exec("UPDATE sync_outbox SET status = 'sent' WHERE id = ?", [id]);
+  }
+
+  markSyncOutboxRetry(id: string, attempts: number): void {
+    const delaySec = Math.min(60, 2 ** attempts);
+    const next = new Date(Date.now() + delaySec * 1000).toISOString();
+    this.db.connection.exec(
+      "UPDATE sync_outbox SET attempts = ?, next_retry_at = ? WHERE id = ?",
+      [attempts + 1, next, id],
+    );
+  }
+
+  markSyncOutboxFailed(id: string): void {
+    this.db.connection.exec("UPDATE sync_outbox SET status = 'failed' WHERE id = ?", [id]);
+  }
+
+  hasPendingOutbox(messageId: MessageId): boolean {
+    const row = this.db.connection.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM message_outbox WHERE message_id = ? AND status = 'pending'",
+      [messageId],
+    );
+    return (Number(row?.n) || 0) > 0;
+  }
+
+  countByChat(chatId: ChatId): number {
+    const row = this.db.connection.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM messages WHERE chat_id = ?",
+      [chatId],
+    );
+    return Number(row?.n) || 0;
+  }
+
+  hasMessagesBefore(chatId: ChatId, createdAt: string): boolean {
+    const row = this.db.connection.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM messages WHERE chat_id = ? AND created_at < ?",
+      [chatId, createdAt],
+    );
+    return (Number(row?.n) || 0) > 0;
   }
 
   listIncomingSince(chatId: ChatId, viewerUserId: UserId, sinceIso: string | null): StoredMessage[] {

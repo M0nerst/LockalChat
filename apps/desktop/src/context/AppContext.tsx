@@ -27,6 +27,7 @@ interface AppContextValue {
   deviceAdminService: DeviceAdminService;
   auditService: AuditService;
   setAuth: (auth: AuthContext | null) => void;
+  patchAuthUser: (user: AuthContext["user"]) => void;
   refreshOrganizationFlag: () => void;
   localDeviceId: string | null;
   setLocalDeviceId: (id: string) => void;
@@ -131,6 +132,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
         } else {
           localStorage.removeItem(SESSION_KEY);
         }
+        state.persist();
+      },
+      patchAuthUser: (user) => {
+        setAuthState((prev) => {
+          if (!prev) return prev;
+          const next = { ...prev, user };
+          state.setAuth(next);
+          return next;
+        });
         state.persist();
       },
       refreshOrganizationFlag: () => {

@@ -35,10 +35,10 @@ export function ContactsPage() {
           <h3 style={{ padding: "16px 20px 4px" }}>Сотрудники</h3>
           <ul className="chat-list" style={{ maxHeight: "none" }}>
             {users
-              .filter((u) => u.id !== auth.user.id)
+              .filter((u) => u.id !== auth.user.id && u.status !== "blocked")
               .map((u) => (
                 <li key={u.id} className="chat-list-item" onClick={() => navigate(`/chat/${u.id}`)}>
-                  <Avatar id={u.id} name={u.displayName} online={u.presence === "online"} />
+                  <Avatar id={u.id} name={u.displayName} avatarUrl={u.avatarUrl} online={u.presence === "online"} />
                   <div className="chat-list-item-body">
                     <div className="chat-list-item-top">
                       <span className="chat-list-name">{u.displayName}</span>

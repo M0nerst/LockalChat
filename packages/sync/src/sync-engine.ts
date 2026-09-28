@@ -1,7 +1,7 @@
 import { randomNonce, signEnvelope as cryptoSignEnvelope } from "@lockal/crypto";
 import type { DatabaseContext } from "@lockal/database";
 import { MessageDeliveryStatus } from "@lockal/domain";
-import type { ChatMessagePayload, ChatAckPayload, DirectorySnapshotPayload } from "@lockal/messaging";
+import type { ChatMessagePayload, ChatAckPayload, DirectorySnapshotPayload, GroupChatPayload } from "@lockal/messaging";
 import type { DirectorySyncService } from "./directory-sync.js";
 import type { FileTransferEngine } from "@lockal/file-transfer";
 import { ChatService } from "@lockal/messaging";
@@ -74,6 +74,13 @@ export class SyncEngine {
       clientNonce: message.clientNonce,
       sentAt: message.createdAt,
     };
+    const chat = this.chats.getChat(message.chatId as never);
+    if (chat?.kind === "group") {
+      payload.group = {
+        title: chat.title ?? "Группа",
+        memberUserIds: this.chats.listMemberIds(message.chatId as never),
+      };
+    }
     await this.transport.discoverPeers();
     const envelope = await this.buildEnvelope("chat.message", payload);
     const repo = this.chats.getMessageRepository();
@@ -84,7 +91,9 @@ export class SyncEngine {
     if (targetDeviceIds.length === 0) {
       repo.updateStatus(message.id, MessageDeliveryStatus.Failed);
       throw new Error(
-        "Устройство собеседника не найдено. Проверьте Contacts → LAN peers (connected) и обновите страницу.",
+        message.recipientUserId
+          ? "Устройство собеседника не найдено. Проверьте Contacts → LAN peers (connected) и обновите страницу."
+          : "Устройства участников группы не найдены. Проверьте, что они в сети (Контакты → LAN).",
       );
     }
     let delivered = false;
@@ -100,6 +109,33 @@ export class SyncEngine {
       message.id,
       delivered ? MessageDeliveryStatus.Sent : MessageDeliveryStatus.Sending,
     );
+  }
+
+  async publishGroupChat(chatId: string): Promise<void> {
+    const chat = this.chats.getChat(chatId as never);
+    if (!chat || chat.kind !== "group") return;
+    const members = this.chats.listMemberIds(chatId as never);
+    const payload: GroupChatPayload = {
+      chatId,
+      title: chat.title ?? "Группа",
+      memberUserIds: members,
+      createdAt: isoNow(),
+    };
+    await this.transport.discoverPeers();
+    const envelope = await this.buildEnvelope("chat.group", payload);
+    const repo = this.chats.getMessageRepository();
+    const targets = this.resolveRecipientDeviceIds(chatId);
+    if (targets.length === 0) {
+      repo.enqueueSyncOutbox("", JSON.stringify(envelope));
+      return;
+    }
+    for (const deviceId of targets) {
+      try {
+        await this.transport.send(deviceId as DeviceId, envelope);
+      } catch {
+        repo.enqueueSyncOutbox(deviceId, JSON.stringify(envelope));
+      }
+    }
   }
 
   /** Re-sends a text message that never left this device (status Failed or
@@ -206,6 +242,9 @@ export class SyncEngine {
       case "chat.message":
         await this.handleChatMessage(envelope);
         break;
+      case "chat.group":
+        this.handleGroupChat(envelope.payload as GroupChatPayload);
+        break;
       case "chat.ack":
         this.handleAck(envelope.payload as ChatAckPayload);
         break;
@@ -238,9 +277,42 @@ export class SyncEngine {
     void peerDeviceId;
   }
 
+  private handleGroupChat(payload: GroupChatPayload): void {
+    if (
+      !payload?.chatId?.startsWith("grp_") ||
+      typeof payload.title !== "string" ||
+      !Array.isArray(payload.memberUserIds)
+    ) {
+      return;
+    }
+    this.chats.upsertGroupChat({
+      organizationId: this.ctx.organizationId as never,
+      chatId: payload.chatId as never,
+      title: payload.title,
+      memberUserIds: payload.memberUserIds as never,
+      createdAt: payload.createdAt,
+    });
+    this.onPersist?.();
+  }
+
   private async handleChatMessage(envelope: ProtocolEnvelope): Promise<void> {
     const payload = envelope.payload as ChatMessagePayload;
-    this.chats.ensureChatFromDirectId(this.ctx.organizationId as never, payload.chatId as never);
+    if (
+      payload.group &&
+      typeof payload.group.title === "string" &&
+      Array.isArray(payload.group.memberUserIds) &&
+      payload.chatId.startsWith("grp_")
+    ) {
+      this.chats.upsertGroupChat({
+        organizationId: this.ctx.organizationId as never,
+        chatId: payload.chatId as never,
+        title: payload.group.title,
+        memberUserIds: payload.group.memberUserIds as never,
+        updateTitle: false,
+      });
+    } else {
+      this.chats.ensureChatFromDirectId(this.ctx.organizationId as never, payload.chatId as never);
+    }
     const repo = this.chats.getMessageRepository();
     if (repo.existsByNonce(payload.chatId as never, payload.clientNonce)) {
       return;
@@ -276,8 +348,12 @@ export class SyncEngine {
     const repo = this.chats.getMessageRepository();
     const existing = repo.findById(payload.messageId as MessageId);
     if (existing?.status === MessageDeliveryStatus.Read) return;
+    const chat = this.chats.getChat(payload.chatId as never);
+    // One member opening a group must not mark the message read for everyone.
     const status =
-      payload.status === "read" ? MessageDeliveryStatus.Read : MessageDeliveryStatus.Delivered;
+      payload.status === "read" && chat?.kind !== "group"
+        ? MessageDeliveryStatus.Read
+        : MessageDeliveryStatus.Delivered;
     repo.updateStatus(payload.messageId as MessageId, status);
     this.onPersist?.();
   }
@@ -285,12 +361,18 @@ export class SyncEngine {
   private static readonly MAX_OUTBOX_ATTEMPTS = 8;
 
   private async flushOutbox(): Promise<void> {
+    await this.flushSyncOutbox();
     const repo = this.chats.getMessageRepository();
     const pending = repo.listPendingOutbox();
     for (const item of pending) {
       if (item.attempts >= SyncEngine.MAX_OUTBOX_ATTEMPTS) {
         repo.markOutboxFailed(item.id);
-        repo.updateStatus(item.messageId as MessageId, MessageDeliveryStatus.Failed);
+        if (!repo.hasPendingOutbox(item.messageId as MessageId)) {
+          const msg = repo.findById(item.messageId as MessageId);
+          if (msg?.status === MessageDeliveryStatus.Sending) {
+            repo.updateStatus(item.messageId as MessageId, MessageDeliveryStatus.Failed);
+          }
+        }
         this.onPersist?.();
         continue;
       }
@@ -298,12 +380,52 @@ export class SyncEngine {
         const envelope = JSON.parse(item.envelopeJson) as ProtocolEnvelope;
         await this.transport.send(item.targetDeviceId, envelope);
         repo.markOutboxSent(item.id);
+        const msg = repo.findById(item.messageId as MessageId);
+        if (msg?.status === MessageDeliveryStatus.Sending) {
+          repo.updateStatus(item.messageId as MessageId, MessageDeliveryStatus.Sent);
+        }
+        this.onPersist?.();
       } catch {
         repo.markOutboxRetry(item.id, item.attempts);
       }
     }
     await this.fileTransfer?.flushOutbox();
     await this.transport.discoverPeers();
+  }
+
+  private async flushSyncOutbox(): Promise<void> {
+    const repo = this.chats.getMessageRepository();
+    for (const item of repo.listPendingSyncOutbox()) {
+      if (item.attempts >= SyncEngine.MAX_OUTBOX_ATTEMPTS) {
+        repo.markSyncOutboxFailed(item.id);
+        continue;
+      }
+      let envelope: ProtocolEnvelope;
+      try {
+        envelope = JSON.parse(item.envelopeJson) as ProtocolEnvelope;
+      } catch {
+        repo.markSyncOutboxFailed(item.id);
+        continue;
+      }
+      const targets = item.targetDeviceId
+        ? [item.targetDeviceId]
+        : this.resolveRecipientDeviceIds((envelope.payload as GroupChatPayload).chatId ?? "");
+      if (targets.length === 0) {
+        repo.markSyncOutboxRetry(item.id, item.attempts);
+        continue;
+      }
+      let failedSpecific = false;
+      for (const deviceId of targets) {
+        try {
+          await this.transport.send(deviceId as DeviceId, envelope);
+        } catch {
+          if (item.targetDeviceId) failedSpecific = true;
+          else repo.enqueueSyncOutbox(deviceId, item.envelopeJson);
+        }
+      }
+      if (failedSpecific) repo.markSyncOutboxRetry(item.id, item.attempts);
+      else repo.markSyncOutboxSent(item.id);
+    }
   }
 
   private async buildEnvelope(messageType: ProtocolEnvelope["messageType"], payload: unknown) {

@@ -84,27 +84,26 @@ function DeliveryMark({
  * disappears while you're inside a conversation. */
 export function MessengerPage() {
   const { t } = useTranslation();
-  const { userId } = useParams();
+  const { userId, groupId } = useParams();
   const navigate = useNavigate();
   const { auth, chatService, networkService, userAdminService, persist } = useApp();
 
   const [tick, setTick] = useState(0);
   const [search, setSearch] = useState("");
-  const [text, setText] = useState("");
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [historyLimits, setHistoryLimits] = useState<Record<string, number>>({});
   const [uploading, setUploading] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [groupOpen, setGroupOpen] = useState(false);
+  const [groupTitle, setGroupTitle] = useState("");
+  const [groupMembers, setGroupMembers] = useState<string[]>([]);
+  const [groupError, setGroupError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesAreaRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
-
-  // Auto-grow the composer up to its CSS max-height (see .composer-input),
-  // then let it scroll internally — matches Telegram's multi-line input.
-  useEffect(() => {
-    const el = composerRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [text]);
+  const stickToBottomRef = useRef(true);
+  const scrollAnchorRef = useRef<number | null>(null);
 
   useEffect(() => {
     const timer = setInterval(() => setTick((v) => v + 1), 2000);
@@ -119,28 +118,46 @@ export function MessengerPage() {
     [auth, userAdminService, tick],
   );
   const chats = useMemo(
-    () => (auth ? chatService.listDirectChatsForUser(auth.user.id) : []),
+    () => (auth ? chatService.listChatsForUser(auth.user.id) : []),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [auth, chatService, tick],
   );
 
   const peer = userId ? orgUsers.find((u) => u.id === userId) ?? null : null;
+  const group = useMemo(
+    () => (groupId ? chatService.getChat(groupId as never) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [chatService, groupId, tick],
+  );
 
   const chatId = useMemo(() => {
+    if (groupId) return groupId as ReturnType<typeof directChatId>;
     if (!auth || !userId) return null;
     return directChatId(auth.user.id, userId as UserId);
-  }, [auth, userId]);
+  }, [auth, userId, groupId]);
+
+  const text = chatId ? (drafts[chatId] ?? "") : "";
+  const historyLimit = chatId ? (historyLimits[chatId] ?? 50) : 50;
+
+  // Auto-grow the composer up to its CSS max-height (see .composer-input),
+  // then let it scroll internally — matches Telegram's multi-line input.
+  useEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [text, chatId]);
 
   useEffect(() => {
-    if (!auth || !chatId || !userId) return;
+    if (!auth || !chatId || !userId || groupId) return;
     chatService.ensureDirectChat(auth.organization.id, auth.user.id, userId as UserId);
     persist();
-  }, [auth, chatId, userId, chatService, persist]);
+  }, [auth, chatId, userId, groupId, chatService, persist]);
 
   const messages = useMemo(
-    () => (chatId ? chatService.listMessages(chatId) : []),
+    () => (chatId ? chatService.listMessages(chatId, historyLimit) : []),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [chatService, chatId, tick],
+    [chatService, chatId, tick, historyLimit],
   );
   const transfers = useMemo(
     () => (chatId ? networkService.getFileDownloadService().listTransferProgress(chatId) : []),
@@ -149,8 +166,26 @@ export function MessengerPage() {
   );
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ block: "end" });
-  }, [messages.length, chatId]);
+    setSendError(null);
+  }, [chatId]);
+
+  useEffect(() => {
+    stickToBottomRef.current = true;
+    scrollAnchorRef.current = null;
+  }, [chatId]);
+
+  useEffect(() => {
+    const el = messagesAreaRef.current;
+    const anchor = scrollAnchorRef.current;
+    if (anchor != null && el) {
+      el.scrollTop = el.scrollHeight - anchor;
+      scrollAnchorRef.current = null;
+      return;
+    }
+    if (stickToBottomRef.current) {
+      messagesEndRef.current?.scrollIntoView({ block: "end" });
+    }
+  }, [messages.length, chatId, historyLimit]);
 
   useEffect(() => {
     if (!auth || !chatId) return;
@@ -163,11 +198,19 @@ export function MessengerPage() {
 
   if (!auth) return <Navigate to="/login" replace />;
   if (userId && !peer) return <Navigate to="/app" replace />;
+  if (groupId && !group) return <Navigate to="/app" replace />;
 
   const userName = (id: string) => orgUsers.find((u) => u.id === id)?.displayName ?? id;
-  const filteredChats = chats.filter((c) =>
-    userName(c.otherUserId).toLowerCase().includes(search.trim().toLowerCase()),
-  );
+  const groupMemberLine = group
+    ? chatService
+        .listMemberIds(group.id)
+        .map((id) => (id === auth.user.id ? "вы" : userName(id)))
+        .join(", ")
+    : "";
+  const filteredChats = chats.filter((c) => {
+    const label = c.kind === "group" ? (c.title ?? "Группа") : userName(c.otherUserId ?? "");
+    return label.toLowerCase().includes(search.trim().toLowerCase());
+  });
 
   async function downloadFile(messageId: string) {
     const file = await networkService.getFileDownloadService().getBlobForMessage(messageId as never);
@@ -176,8 +219,24 @@ export function MessengerPage() {
     const a = document.createElement("a");
     a.href = url;
     a.download = file.fileName;
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
+  function loadOlder() {
+    if (!chatId) return;
+    const el = messagesAreaRef.current;
+    scrollAnchorRef.current = el ? el.scrollHeight - el.scrollTop : 0;
+    stickToBottomRef.current = false;
+    setHistoryLimits((prev) => ({ ...prev, [chatId]: (prev[chatId] ?? 50) + 50 }));
+  }
+
+  function onMessagesScroll() {
+    const el = messagesAreaRef.current;
+    if (!el || scrollAnchorRef.current != null) return;
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   }
 
   async function loadPreviewUrl(messageId: string): Promise<string | null> {
@@ -203,7 +262,11 @@ export function MessengerPage() {
 
   async function onSend(e: { preventDefault(): void }) {
     e.preventDefault();
-    if (!text.trim() || !auth || !chatId || !userId) return;
+    if (!text.trim() || !auth || !chatId || (!userId && !groupId)) return;
+    if (peer?.status === "blocked") {
+      setSendError("Пользователь заблокирован");
+      return;
+    }
     setSendError(null);
     const msg = chatService.sendTextMessage({
       chatId,
@@ -211,7 +274,7 @@ export function MessengerPage() {
       senderDeviceId: auth.device.id,
       text: text.trim(),
     });
-    setText("");
+    setDrafts((prev) => ({ ...prev, [chatId]: "" }));
     const engine = networkService.getSyncEngine();
     try {
       if (engine) {
@@ -222,7 +285,7 @@ export function MessengerPage() {
           content: msg.contentText,
           clientNonce: msg.clientNonce,
           createdAt: msg.createdAt,
-          recipientUserId: userId,
+          recipientUserId: groupId ? undefined : userId,
         });
       } else {
         chatService.getMessageRepository().updateStatus(msg.id, MessageDeliveryStatus.Failed);
@@ -230,17 +293,20 @@ export function MessengerPage() {
       }
       persist();
     } catch (err) {
-      chatService.getMessageRepository().updateStatus(msg.id, MessageDeliveryStatus.Failed);
+      const current = chatService.getMessageRepository().findById(msg.id);
+      if (!current || current.status === MessageDeliveryStatus.Sending) {
+        chatService.getMessageRepository().updateStatus(msg.id, MessageDeliveryStatus.Failed);
+      }
       setSendError((err as Error).message);
       persist();
     }
   }
 
   async function retryMessage(messageId: string) {
-    if (!userId) return;
+    if (!userId && !groupId) return;
     setSendError(null);
     try {
-      await networkService.getSyncEngine()?.retryChatMessage(messageId as never, userId);
+      await networkService.getSyncEngine()?.retryChatMessage(messageId as never, groupId ? undefined : userId);
       persist();
       setTick((v) => v + 1);
     } catch (err) {
@@ -251,9 +317,23 @@ export function MessengerPage() {
   }
 
   async function onFileSelected(file: File | null) {
-    if (!file || !auth || !chatId || !userId) return;
+    if (!file || !auth || !chatId || (!userId && !groupId)) return;
+    if (peer?.status === "blocked") {
+      setSendError("Пользователь заблокирован");
+      return;
+    }
+    const recipient = (
+      groupId ? chatService.listMemberIds(chatId).find((id) => id !== auth.user.id) : userId
+    ) as UserId | undefined;
+    if (!recipient) {
+      setSendError("Некому отправить файл");
+      return;
+    }
     const engine = networkService.getFileTransferEngine();
-    if (!engine) return;
+    if (!engine) {
+      setSendError("Нет связи с сетью. Повторите отправку, когда сервис LAN заработает.");
+      return;
+    }
     setUploading(true);
     try {
       await engine.sendFile({
@@ -262,7 +342,7 @@ export function MessengerPage() {
         mimeType: file.type || "application/octet-stream",
         chatId,
         sender: auth.user,
-        recipientUserId: userId as UserId,
+        recipientUserId: recipient,
       });
       persist();
       setTick((v) => v + 1);
@@ -288,13 +368,44 @@ export function MessengerPage() {
     }
   }
 
+  async function createGroup() {
+    if (!auth) return;
+    setGroupError(null);
+    try {
+      const id = chatService.createGroupChat({
+        organizationId: auth.organization.id,
+        creatorId: auth.user.id,
+        title: groupTitle,
+        memberUserIds: groupMembers as UserId[],
+      });
+      await networkService.getSyncEngine()?.publishGroupChat(id);
+      persist();
+      setGroupOpen(false);
+      setGroupTitle("");
+      setGroupMembers([]);
+      navigate(`/group/${id}`);
+    } catch (err) {
+      setGroupError((err as Error).message);
+    }
+  }
+
   return (
     <div className="messenger-shell">
       <AppSidebar />
 
       <div className="chat-list-panel">
         <div className="chat-list-header">
-          <h2 style={{ margin: 0 }}>{t("nav.chats")}</h2>
+          <h2>{t("nav.chats")}</h2>
+          <button
+            type="button"
+            className="secondary chat-new-group"
+            onClick={() => {
+              setGroupError(null);
+              setGroupOpen(true);
+            }}
+          >
+            Группа
+          </button>
         </div>
         <div className="chat-search-wrap">
           <input
@@ -319,34 +430,43 @@ export function MessengerPage() {
         ) : (
           <ul className="chat-list">
             {filteredChats.map((c) => {
-              const other = orgUsers.find((u) => u.id === c.otherUserId);
+              const isGroup = c.kind === "group";
+              const other = !isGroup ? orgUsers.find((u) => u.id === c.otherUserId) : undefined;
+              const title = isGroup ? (c.title ?? "Группа") : (other?.displayName ?? c.otherUserId ?? "");
               const isFile = c.lastMessageType === "file";
               const body = c.lastMessageText
                 ? isFile
                   ? `📎 ${c.lastMessageText}`
                   : c.lastMessageText
-                : "Нет сообщений";
+                : isGroup
+                  ? "Группа"
+                  : "Нет сообщений";
+              const previewBody = body.replace(/\s+/g, " ").trim();
               const preview =
-                c.lastMessageText && c.lastMessageSenderUserId === auth.user.id ? `Вы: ${body}` : body;
+                c.lastMessageText && c.lastMessageSenderUserId === auth.user.id
+                  ? `Вы: ${previewBody}`
+                  : previewBody;
+              const active = isGroup ? c.chatId === groupId : c.otherUserId === userId;
               return (
                 <li
                   key={c.chatId}
-                  className={`chat-list-item${c.otherUserId === userId ? " active" : ""}`}
-                  onClick={() => navigate(`/chat/${c.otherUserId}`)}
+                  className={`chat-list-item${active ? " active" : ""}`}
+                  onClick={() => navigate(isGroup ? `/group/${c.chatId}` : `/chat/${c.otherUserId}`)}
                 >
                   <Avatar
-                    id={c.otherUserId}
-                    name={other?.displayName ?? c.otherUserId}
-                    online={other?.presence === "online"}
+                    id={isGroup ? c.chatId : (c.otherUserId ?? c.chatId)}
+                    name={title}
+                    avatarUrl={other?.avatarUrl}
+                    online={isGroup ? undefined : other?.presence === "online"}
                   />
                   <div className="chat-list-item-body">
                     <div className="chat-list-item-top">
-                      <span className="chat-list-name">{other?.displayName ?? c.otherUserId}</span>
+                      <span className="chat-list-name">{title}</span>
                       <span className="chat-list-time">{formatListTime(c.updatedAt)}</span>
                     </div>
                     <div className="chat-list-preview-row">
                       <div className="chat-list-preview">{preview}</div>
-                      {c.otherUserId !== userId && c.unreadCount > 0 && (
+                      {!active && c.unreadCount > 0 && (
                         <span className="unread-badge">{c.unreadCount > 99 ? "99+" : c.unreadCount}</span>
                       )}
                     </div>
@@ -359,22 +479,49 @@ export function MessengerPage() {
       </div>
 
       <div className="conversation-panel">
-        {!peer || !chatId ? (
+        {!chatId || (!peer && !group) ? (
           <div className="conversation-empty">
-            Выберите чат слева, чтобы начать общение,
-            <br />
-            либо откройте «Контакты», чтобы написать новому человеку.
+            <img src="/logo.png" alt="" className="conversation-empty-logo" />
+            <div>
+              Выберите чат слева
+              <br />
+              или создайте группу
+            </div>
           </div>
         ) : (
           <>
             <div className="conversation-header">
-              <Avatar id={peer.id} name={peer.displayName} online={peer.presence === "online"} />
-              <div>
-                <div className="conversation-header-name">{peer.displayName}</div>
-                <div className="conversation-header-status">{formatPresence(peer)}</div>
-              </div>
+              {group ? (
+                <>
+                  <Avatar id={group.id} name={group.title ?? "Группа"} />
+                  <div>
+                    <div className="conversation-header-name">{group.title ?? "Группа"}</div>
+                    <div className="conversation-header-status" title={groupMemberLine}>
+                      {groupMemberLine}
+                    </div>
+                  </div>
+                </>
+              ) : peer ? (
+                <>
+                  <Avatar
+                    id={peer.id}
+                    name={peer.displayName}
+                    avatarUrl={peer.avatarUrl}
+                    online={peer.presence === "online"}
+                  />
+                  <div>
+                    <div className="conversation-header-name">{peer.displayName}</div>
+                    <div className="conversation-header-status">{formatPresence(peer)}</div>
+                  </div>
+                </>
+              ) : null}
             </div>
-            <div className="messages-area">
+            <div className="messages-area" ref={messagesAreaRef} onScroll={onMessagesScroll}>
+              {chatId && chatService.countMessages(chatId) > messages.length && (
+                  <button type="button" className="secondary load-earlier" onClick={loadOlder}>
+                    Более ранние сообщения
+                  </button>
+                )}
               {messages.map((m) => {
                 const own = m.senderUserId === auth.user.id;
                 const transfer =
@@ -382,6 +529,9 @@ export function MessengerPage() {
                 return (
                   <div key={m.id} className={`msg-row${own ? " own" : ""}`}>
                     <div className="msg-bubble">
+                      {group && !own && (
+                        <div className="msg-sender">{userName(m.senderUserId)}</div>
+                      )}
                       {m.contentType === "file" ? (
                         transfer ? (
                           <FileAttachment
@@ -444,13 +594,13 @@ export function MessengerPage() {
                 type="file"
                 style={{ display: "none" }}
                 onChange={(e) => void onFileSelected(e.target.files?.[0] ?? null)}
-                disabled={uploading}
+                disabled={uploading || peer?.status === "blocked"}
               />
               <button
                 type="button"
                 className="secondary composer-icon-btn"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={uploading}
+                disabled={uploading || peer?.status === "blocked"}
                 title="Прикрепить файл"
               >
                 📎
@@ -460,19 +610,31 @@ export function MessengerPage() {
                 className="composer-input"
                 rows={1}
                 value={text}
-                onChange={(e) => setText(e.target.value)}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  if (!chatId) return;
+                  setDrafts((prev) => ({ ...prev, [chatId]: value }));
+                }}
                 onKeyDown={(e) => {
-                  // Enter sends the message; Shift+Enter inserts a newline —
-                  // same convention as Telegram/Slack/etc.
-                  if (e.key === "Enter" && !e.shiftKey) {
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                     e.preventDefault();
                     void onSend(e);
                   }
                 }}
-                placeholder={uploading ? "Отправка файла…" : "Сообщение…"}
-                disabled={uploading}
+                placeholder={
+                  peer?.status === "blocked"
+                    ? "Пользователь заблокирован"
+                    : uploading
+                      ? "Отправка файла…"
+                      : "Сообщение…"
+                }
+                disabled={uploading || peer?.status === "blocked"}
               />
-              <button type="submit" className="composer-send" disabled={!text.trim() || uploading}>
+              <button
+                type="submit"
+                className="composer-send"
+                disabled={!text.trim() || uploading || peer?.status === "blocked"}
+              >
                 ➤
               </button>
             </form>
@@ -484,6 +646,60 @@ export function MessengerPage() {
           </>
         )}
       </div>
+      {groupOpen && (
+        <div className="modal-backdrop" onClick={() => { setGroupOpen(false); setGroupError(null); }}>
+          <div className="card modal-card" onClick={(e) => e.stopPropagation()}>
+            <h3>Новая группа</h3>
+            <label htmlFor="group-title">Название</label>
+            <input
+              id="group-title"
+              value={groupTitle}
+              onChange={(e) => setGroupTitle(e.target.value)}
+              placeholder="Например, Отдел"
+            />
+            <p className="auth-subtitle" style={{ textAlign: "left" }}>
+              Участники
+            </p>
+            <ul className="group-member-list">
+              {orgUsers
+                .filter((u) => u.id !== auth.user.id && u.status !== "blocked")
+                .map((u) => (
+                  <li key={u.id}>
+                    <label className="group-member-row">
+                      <input
+                        type="checkbox"
+                        checked={groupMembers.includes(u.id)}
+                        onChange={(e) => {
+                          setGroupMembers((prev) =>
+                            e.target.checked ? [...prev, u.id] : prev.filter((id) => id !== u.id),
+                          );
+                        }}
+                      />
+                      <Avatar id={u.id} name={u.displayName} size={32} avatarUrl={u.avatarUrl} />
+                      <span>{u.displayName}</span>
+                    </label>
+                  </li>
+                ))}
+            </ul>
+            {groupError && <p className="error">{groupError}</p>}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => {
+                  setGroupOpen(false);
+                  setGroupError(null);
+                }}
+              >
+                Отмена
+              </button>
+              <button type="button" onClick={() => void createGroup()}>
+                Создать
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

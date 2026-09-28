@@ -8,6 +8,11 @@ export interface FileMetaPayload {
   sha256Hex: string;
   chunkSize: number;
   totalChunks: number;
+  /** Lets a peer create the group chat even if the roster envelope was missed. */
+  group?: {
+    title: string;
+    memberUserIds: string[];
+  };
 }
 
 export interface FileChunkPayload {

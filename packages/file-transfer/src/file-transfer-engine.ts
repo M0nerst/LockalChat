@@ -100,7 +100,7 @@ export class FileTransferEngine {
     this.transfers.linkAttachment(msgId, transferId, transferId);
 
     await this.transport.discoverPeers();
-    if (this.collectTargetDevices(input.recipientUserId).length === 0) {
+    if (this.collectTargetDevices(input.recipientUserId, input.chatId).length === 0) {
       this.transfers.setStatus(transferId, "failed");
       this.chats.getMessageRepository().updateStatus(msgId, MessageDeliveryStatus.Failed);
       throw new Error(
@@ -108,7 +108,7 @@ export class FileTransferEngine {
       );
     }
 
-    await this.deliverOutgoingFile(transferId, input.file, input.recipientUserId);
+    await this.deliverOutgoingFile(transferId, input.file, input.recipientUserId, input.chatId);
     return { transferId, messageId: msgId };
   }
 
@@ -127,7 +127,7 @@ export class FileTransferEngine {
       throw new Error("Собеседник не найден");
     }
     await this.transport.discoverPeers();
-    if (this.collectTargetDevices(recipientUserId).length === 0) {
+    if (this.collectTargetDevices(recipientUserId, tr.chatId).length === 0) {
       throw new Error(
         "Устройство собеседника не найдено. Проверьте Contacts → LAN peers (connected).",
       );
@@ -137,16 +137,18 @@ export class FileTransferEngine {
     if (tr.messageId) {
       this.chats.getMessageRepository().updateStatus(tr.messageId, MessageDeliveryStatus.Sending);
     }
-    await this.deliverOutgoingFile(transferId, blob, recipientUserId);
+    await this.deliverOutgoingFile(transferId, blob, recipientUserId, tr.chatId);
   }
 
   private async deliverOutgoingFile(
     transferId: string,
     file: Blob,
     recipientUserId: UserId,
+    chatId?: string,
   ): Promise<void> {
     const tr = this.transfers.get(transferId);
     if (!tr) return;
+    const chat = this.chats.getChat(tr.chatId);
     const meta: FileMetaPayload = {
       transferId,
       chatId: tr.chatId,
@@ -157,11 +159,18 @@ export class FileTransferEngine {
       sha256Hex: tr.sha256Hex,
       chunkSize: tr.chunkSize,
       totalChunks: tr.totalChunks,
+      group:
+        chat?.kind === "group"
+          ? {
+              title: chat.title ?? "Группа",
+              memberUserIds: this.chats.listMemberIds(tr.chatId),
+            }
+          : undefined,
     };
     const metaEnvelope = await this.signEnvelope("file.meta", meta);
     await this.broadcastToPeers(recipientUserId, metaEnvelope, (deviceId, env) => {
       this.transfers.enqueueChunkOutbox(transferId, -1, deviceId, JSON.stringify(env));
-    });
+    }, chatId ?? tr.chatId);
     await this.sendChunksFrom(transferId, file, 0, recipientUserId);
   }
 
@@ -253,11 +262,26 @@ export class FileTransferEngine {
         if (item.chunkIndex >= 0) {
           const tr = this.transfers.get(item.transferId);
           if (tr) {
-            this.transfers.updateProgress(item.transferId, item.chunkIndex + 1, tr.status);
+            const next = Math.max(tr.nextChunkIndex, item.chunkIndex + 1);
+            this.transfers.updateProgress(item.transferId, next, tr.status);
           }
         }
       } catch {
         this.transfers.markChunkRetry(item.id, item.attempts);
+      }
+    }
+    const touched = new Set(pending.map((item) => item.transferId));
+    for (const transferId of touched) {
+      const tr = this.transfers.get(transferId);
+      if (!tr || tr.status !== "sending") continue;
+      if (tr.nextChunkIndex < tr.totalChunks) continue;
+      if (this.transfers.hasPendingOutbox(transferId)) continue;
+      this.transfers.markCompleted(transferId);
+      if (tr.messageId) {
+        this.db.connection.exec(
+          "UPDATE messages SET status = ? WHERE id = ? AND status = ?",
+          [MessageDeliveryStatus.Sent, tr.messageId, MessageDeliveryStatus.Sending],
+        );
       }
     }
   }
@@ -265,7 +289,11 @@ export class FileTransferEngine {
   private async handleMeta(meta: FileMetaPayload, senderDeviceId: DeviceId): Promise<void> {
     const existing = this.transfers.get(meta.transferId);
     const device = this.db.devices.findById(senderDeviceId);
-    const senderUserId = (device?.userId ?? "unknown") as UserId;
+    const known = this.db.connection.get<{ user_id: string }>(
+      "SELECT user_id FROM known_peers WHERE device_id = ?",
+      [senderDeviceId],
+    );
+    const senderUserId = (device?.userId ?? known?.user_id ?? "unknown") as UserId;
     if (!existing) {
       this.transfers.create({
         id: meta.transferId,
@@ -286,10 +314,28 @@ export class FileTransferEngine {
     // Ensure the chat row exists using the *chat id's own* participants — not
     // (senderUserId, ctx.userId), which collapse to the same person when this
     // copy arrives via multi-device sync from one of our own other devices.
-    this.chats.ensureChatFromDirectId(
-      (this.db.organizations.getFirst()?.id ?? "") as never,
-      meta.chatId as never,
-    );
+    if (
+      meta.group &&
+      typeof meta.group.title === "string" &&
+      Array.isArray(meta.group.memberUserIds) &&
+      meta.chatId.startsWith("grp_")
+    ) {
+      const org = this.db.organizations.getFirst();
+      if (org) {
+        this.chats.upsertGroupChat({
+          organizationId: org.id,
+          chatId: meta.chatId as never,
+          title: meta.group.title,
+          memberUserIds: meta.group.memberUserIds as never,
+          updateTitle: false,
+        });
+      }
+    } else {
+      this.chats.ensureChatFromDirectId(
+        (this.db.organizations.getFirst()?.id ?? "") as never,
+        meta.chatId as never,
+      );
+    }
     const msgExists = this.db.connection.get<{ id: string }>(
       "SELECT id FROM messages WHERE id = ?",
       [meta.messageId],
@@ -388,7 +434,7 @@ export class FileTransferEngine {
       const env = await this.signEnvelope("file.chunk", chunk);
       await this.broadcastToPeers(recipientUserId, env, (deviceId, envelope) => {
         this.transfers.enqueueChunkOutbox(transferId, i, deviceId, JSON.stringify(envelope));
-      });
+      }, tr.chatId);
       this.transfers.updateProgress(transferId, i + 1, "sending");
     }
     await this.flushOutbox();
@@ -405,12 +451,18 @@ export class FileTransferEngine {
     }
   }
 
-  private collectTargetDevices(recipientUserId: UserId): DeviceId[] {
+  private collectTargetDevices(recipientUserId: UserId, chatId?: string): DeviceId[] {
     const org = this.db.organizations.getFirst();
     if (!org) return [];
-    // Also target our own other devices (multi-device sync) — `d.id !== this.ctx.deviceId`
-    // still excludes the device we're sending from.
     const targetUserIds = new Set<string>([recipientUserId, this.ctx.userId]);
+    if (chatId) {
+      for (const row of this.db.connection.all<{ user_id: string }>(
+        "SELECT user_id FROM chat_members WHERE chat_id = ?",
+        [chatId],
+      )) {
+        targetUserIds.add(row.user_id);
+      }
+    }
     const ids = new Set<string>();
     for (const d of this.db.devices.listByOrganization(org.id)) {
       if (targetUserIds.has(d.userId) && d.id !== this.ctx.deviceId) ids.add(d.id);
@@ -419,10 +471,10 @@ export class FileTransferEngine {
       if (p.userId && targetUserIds.has(p.userId) && p.deviceId !== this.ctx.deviceId) ids.add(p.deviceId);
     }
     for (const row of this.db.connection.all<{ device_id: string; user_id: string }>(
-      "SELECT device_id, user_id FROM known_peers WHERE user_id = ? OR user_id = ?",
-      [recipientUserId, this.ctx.userId],
+      "SELECT device_id, user_id FROM known_peers WHERE organization_id = ?",
+      [org.id],
     )) {
-      if (row.device_id !== this.ctx.deviceId) ids.add(row.device_id);
+      if (targetUserIds.has(row.user_id) && row.device_id !== this.ctx.deviceId) ids.add(row.device_id);
     }
     return [...ids] as DeviceId[];
   }
@@ -431,9 +483,10 @@ export class FileTransferEngine {
     recipientUserId: UserId,
     envelope: ProtocolEnvelope,
     onQueue: (deviceId: DeviceId, env: ProtocolEnvelope) => void,
+    chatId?: string,
   ): Promise<void> {
     await this.transport.discoverPeers();
-    const targets = this.collectTargetDevices(recipientUserId);
+    const targets = this.collectTargetDevices(recipientUserId, chatId);
     if (targets.length === 0) {
       const org = this.db.organizations.getFirst();
       if (org) {

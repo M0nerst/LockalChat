@@ -2,7 +2,7 @@ import type { DatabaseContext } from "@lockal/database";
 import { MessageDeliveryStatus } from "@lockal/domain";
 import type { User } from "@lockal/domain";
 import type { ChatId, DeviceId, OrganizationId, UserId } from "@lockal/shared";
-import { isoNow, messageId, randomBytes } from "@lockal/shared";
+import { isoNow, messageId, randomBytes, generateId } from "@lockal/shared";
 import { bytesToBase64Url } from "@lockal/crypto";
 import { MessageRepository, type StoredMessage } from "./message-repository.js";
 
@@ -34,6 +34,83 @@ export class ChatService {
       );
     }
     return id;
+  }
+
+  createGroupChat(input: {
+    organizationId: OrganizationId;
+    creatorId: UserId;
+    title: string;
+    memberUserIds: UserId[];
+  }): ChatId {
+    const title = input.title.trim();
+    if (!title) throw new Error("Укажите название группы");
+    const members = [...new Set([input.creatorId, ...input.memberUserIds])];
+    if (members.length < 2) throw new Error("Добавьте хотя бы одного участника");
+    const id = generateId("grp") as ChatId;
+    const now = isoNow();
+    this.db.connection.exec(
+      "INSERT INTO chats (id, organization_id, kind, title, created_at, updated_at) VALUES (?, ?, 'group', ?, ?, ?)",
+      [id, input.organizationId, title, now, now],
+    );
+    for (const uid of members) {
+      this.db.connection.exec(
+        "INSERT OR IGNORE INTO chat_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)",
+        [id, uid, now],
+      );
+    }
+    return id;
+  }
+
+  /** Creates or refreshes a group that arrived from another device. */
+  upsertGroupChat(input: {
+    organizationId: OrganizationId;
+    chatId: ChatId;
+    title: string;
+    memberUserIds: UserId[];
+    createdAt?: string;
+    /** When false, an existing group's title is left alone (message retries must not rename it). */
+    updateTitle?: boolean;
+  }): void {
+    if (!input.chatId.startsWith("grp_")) return;
+    const title = input.title.trim();
+    const now = input.createdAt ?? isoNow();
+    const existing = this.db.connection.get<{ id: string; kind: string }>(
+      "SELECT id, kind FROM chats WHERE id = ?",
+      [input.chatId],
+    );
+    if (existing && existing.kind !== "group") return;
+    if (!existing) {
+      this.db.connection.exec(
+        "INSERT INTO chats (id, organization_id, kind, title, created_at, updated_at) VALUES (?, ?, 'group', ?, ?, ?)",
+        [input.chatId, input.organizationId, title || "Группа", now, now],
+      );
+    } else if (input.updateTitle !== false && title) {
+      this.db.connection.exec("UPDATE chats SET title = ? WHERE id = ? AND kind = 'group'", [
+        title,
+        input.chatId,
+      ]);
+    }
+    for (const uid of input.memberUserIds) {
+      this.db.connection.exec(
+        "INSERT OR IGNORE INTO chat_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)",
+        [input.chatId, uid, now],
+      );
+    }
+  }
+
+  listMemberIds(chatId: ChatId): UserId[] {
+    return this.db.connection
+      .all<{ user_id: string }>("SELECT user_id FROM chat_members WHERE chat_id = ?", [chatId])
+      .map((r) => r.user_id as UserId);
+  }
+
+  getChat(chatId: ChatId): { id: ChatId; kind: string; title: string | null } | null {
+    const row = this.db.connection.get<{ id: string; kind: string; title: string | null }>(
+      "SELECT id, kind, title FROM chats WHERE id = ?",
+      [chatId],
+    );
+    if (!row) return null;
+    return { id: row.id as ChatId, kind: row.kind, title: row.title };
   }
 
   sendTextMessage(input: {
@@ -87,6 +164,14 @@ export class ChatService {
     return this.messages.listByChat(chatId, limit).reverse();
   }
 
+  hasMessagesBefore(chatId: ChatId, createdAt: string): boolean {
+    return this.messages.hasMessagesBefore(chatId, createdAt);
+  }
+
+  countMessages(chatId: ChatId): number {
+    return this.messages.countByChat(chatId);
+  }
+
   listDirectChatsForUser(userId: UserId): Array<{
     chatId: ChatId;
     otherUserId: UserId;
@@ -105,7 +190,10 @@ export class ChatService {
       last_sender: string | null;
       unread_count: number;
     }>(
-      `SELECT c.id AS chat_id, cm2.user_id AS other_user_id, c.updated_at AS updated_at,
+      `SELECT c.id AS chat_id,
+              (SELECT cm2.user_id FROM chat_members cm2
+                WHERE cm2.chat_id = c.id AND cm2.user_id != ? LIMIT 1) AS other_user_id,
+              c.updated_at AS updated_at,
               (SELECT content_text FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) AS last_text,
               (SELECT content_type FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) AS last_type,
               (SELECT sender_user_id FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) AS last_sender,
@@ -114,10 +202,12 @@ export class ChatService {
                   AND m.created_at > COALESCE(cm.last_read_at, '')) AS unread_count
        FROM chats c
        JOIN chat_members cm ON cm.chat_id = c.id AND cm.user_id = ?
-       JOIN chat_members cm2 ON cm2.chat_id = c.id AND cm2.user_id != ?
        WHERE c.kind = 'direct'
+         AND EXISTS (
+           SELECT 1 FROM chat_members cm3 WHERE cm3.chat_id = c.id AND cm3.user_id != ?
+         )
        ORDER BY c.updated_at DESC`,
-      [userId, userId, userId],
+      [userId, userId, userId, userId],
     );
     return rows.map((r) => ({
       chatId: r.chat_id as ChatId,
@@ -130,6 +220,59 @@ export class ChatService {
     }));
   }
 
+  listChatsForUser(userId: UserId): Array<{
+    chatId: ChatId;
+    kind: "direct" | "group";
+    title: string | null;
+    otherUserId: UserId | null;
+    updatedAt: string;
+    lastMessageText: string | null;
+    lastMessageType: string | null;
+    lastMessageSenderUserId: UserId | null;
+    unreadCount: number;
+  }> {
+    const direct = this.listDirectChatsForUser(userId).map((c) => ({
+      ...c,
+      kind: "direct" as const,
+      title: null,
+    }));
+    const groups = this.db.connection
+      .all<{
+        chat_id: string;
+        title: string | null;
+        updated_at: string;
+        last_text: string | null;
+        last_type: string | null;
+        last_sender: string | null;
+        unread_count: number;
+      }>(
+        `SELECT c.id AS chat_id, c.title AS title, c.updated_at AS updated_at,
+                (SELECT content_text FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) AS last_text,
+                (SELECT content_type FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) AS last_type,
+                (SELECT sender_user_id FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) AS last_sender,
+                (SELECT COUNT(*) FROM messages m
+                  WHERE m.chat_id = c.id AND m.sender_user_id != ?
+                    AND m.created_at > COALESCE(cm.last_read_at, '')) AS unread_count
+         FROM chats c
+         JOIN chat_members cm ON cm.chat_id = c.id AND cm.user_id = ?
+         WHERE c.kind = 'group'
+         ORDER BY c.updated_at DESC`,
+        [userId, userId],
+      )
+      .map((r) => ({
+        chatId: r.chat_id as ChatId,
+        kind: "group" as const,
+        title: r.title,
+        otherUserId: null,
+        updatedAt: r.updated_at,
+        lastMessageText: r.last_text,
+        lastMessageType: r.last_type,
+        lastMessageSenderUserId: (r.last_sender as UserId) ?? null,
+        unreadCount: Number(r.unread_count) || 0,
+      }));
+    return [...direct, ...groups].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
   /** Returns incoming messages that the viewer has not yet marked as read,
    * then stamps `chat_members.last_read_at`. Empty when there's nothing new
    * — callers use the returned rows to send `chat.ack` read receipts. */
@@ -140,9 +283,16 @@ export class ChatService {
     );
     const unread = this.messages.listIncomingSince(chatId, viewerUserId, row?.last_read_at ?? null);
     if (unread.length === 0) return [];
+    // Stamp at least as far as the newest message. A sender clock that is ahead
+    // of ours would otherwise leave created_at > last_read_at forever, so the
+    // badge never clears.
+    let readAt = isoNow();
+    for (const message of unread) {
+      if (message.createdAt > readAt) readAt = message.createdAt;
+    }
     this.db.connection.exec(
       "UPDATE chat_members SET last_read_at = ? WHERE chat_id = ? AND user_id = ?",
-      [isoNow(), chatId, viewerUserId],
+      [readAt, chatId, viewerUserId],
     );
     return unread;
   }

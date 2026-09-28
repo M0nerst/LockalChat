@@ -3,9 +3,11 @@ import { Navigate } from "react-router-dom";
 import { i18n, useTheme } from "@lockal/ui";
 import { useApp } from "../context/AppContext.js";
 import { AppSidebar } from "../components/AppSidebar.js";
+import { Avatar } from "../components/Avatar.js";
+import { AVATAR_PALETTE } from "../utils/avatar.js";
 
 export function SettingsPage() {
-  const { auth, networkService, resetLocalData } = useApp();
+  const { auth, networkService, resetLocalData, userAdminService, patchAuthUser, persist } = useApp();
   const { mode, setMode } = useTheme();
   const [daemonOk, setDaemonOk] = useState<boolean | null>(null);
   const [lang, setLang] = useState(i18n.language);
@@ -15,6 +17,12 @@ export function SettingsPage() {
   const [daemonWsUrl, setDaemonWsUrl] = useState(
     localStorage.getItem("lockal.daemonWsUrl") ?? networkService.transport.getWsUrl(),
   );
+  const [displayName, setDisplayName] = useState(auth?.user.displayName ?? "");
+  const [avatarUrl, setAvatarUrl] = useState(auth?.user.avatarUrl ?? null);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [profileOk, setProfileOk] = useState(false);
 
   useEffect(() => {
     void networkService.transport
@@ -50,11 +58,85 @@ export function SettingsPage() {
     resetLocalData();
   }
 
+  async function saveProfile(e: React.FormEvent) {
+    e.preventDefault();
+    if (!auth) return;
+    setProfileError(null);
+    setProfileOk(false);
+    try {
+      const user = userAdminService.updateOwnProfile(auth.user, {
+        displayName,
+        avatarUrl,
+        currentPassword: currentPassword || undefined,
+        newPassword: newPassword || undefined,
+      });
+      patchAuthUser(user);
+      persist();
+      await networkService.syncDirectory();
+      setCurrentPassword("");
+      setNewPassword("");
+      setProfileOk(true);
+    } catch (err) {
+      setProfileError((err as Error).message);
+    }
+  }
+
   return (
     <div className="app-shell">
       <AppSidebar />
       <main className="main">
         <div className="card">
+          <h3>Профиль</h3>
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: 12 }}>
+            <Avatar id={auth.user.id} name={displayName || auth.user.displayName} avatarUrl={avatarUrl} size={64} />
+          </div>
+          <form onSubmit={(e) => void saveProfile(e)}>
+            <label htmlFor="profile-name">Отображаемое имя</label>
+            <input id="profile-name" value={displayName} onChange={(e) => setDisplayName(e.target.value)} required />
+            <label>Цвет аватарки</label>
+            <div className="color-swatches">
+              <button
+                type="button"
+                className={`color-swatch${!avatarUrl ? " selected" : ""}`}
+                style={{ ["--swatch" as string]: "#8a8478" }}
+                title="Как раньше"
+                onClick={() => setAvatarUrl(null)}
+              />
+              {AVATAR_PALETTE.map((color) => (
+                <button
+                  key={color}
+                  type="button"
+                  className={`color-swatch${avatarUrl === `color:${color}` ? " selected" : ""}`}
+                  style={{ ["--swatch" as string]: color }}
+                  onClick={() => setAvatarUrl(`color:${color}`)}
+                />
+              ))}
+            </div>
+            <label htmlFor="profile-login">Логин</label>
+            <input id="profile-login" value={auth.user.username} disabled />
+            <label htmlFor="profile-current">Текущий пароль</label>
+            <input
+              id="profile-current"
+              type="password"
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              autoComplete="current-password"
+              placeholder="Только если меняете пароль"
+            />
+            <label htmlFor="profile-new">Новый пароль</label>
+            <input
+              id="profile-new"
+              type="password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              autoComplete="new-password"
+            />
+            {profileError && <p className="error">{profileError}</p>}
+            {profileOk && <p style={{ color: "var(--muted)", fontSize: 14 }}>Сохранено</p>}
+            <button type="submit">Сохранить профиль</button>
+          </form>
+        </div>
+        <div className="card" style={{ marginTop: 16 }}>
           <h3>Сеть</h3>
           <p>
             LAN:{" "}
