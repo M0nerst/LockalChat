@@ -10,8 +10,10 @@ import {
   UserAdminService,
   type AuthContext,
 } from "@lockal/application";
+import { isTauri } from "@tauri-apps/api/core";
 import { ChatService } from "@lockal/messaging";
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createDesktopHistoryStore } from "../tauri/history.js";
 
 interface AppContextValue {
   ready: boolean;
@@ -54,18 +56,32 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     void (async () => {
       try {
-        const app = await AppState.create();
+        const history = createDesktopHistoryStore();
+        const app = await AppState.create(undefined, history);
         setState(app);
         networkRef.current = new NetworkService(app.db, app.secureStorage);
         networkRef.current.setPersistHook(() => app.persist());
         setHasOrganization(!!app.db.organizations.getFirst());
 
-        // persist() is debounced (see AppState) so bursts of writes (e.g. a
-        // file transfer) don't block the UI thread on every chunk. That
-        // means the very last write can still be "in flight" when the
-        // window closes — flush it synchronously here so nothing is lost.
-        const flushOnExit = () => app.flush();
-        window.addEventListener("beforeunload", flushOnExit);
+        // persist() is debounced, so the last change can still be waiting
+        // when the window closes. The desktop build writes that snapshot to
+        // disk before the window is destroyed.
+        window.addEventListener("beforeunload", () => app.flush());
+        if (isTauri()) {
+          const { getCurrentWindow } = await import("@tauri-apps/api/window");
+          const win = getCurrentWindow();
+          let closing = false;
+          await win.onCloseRequested(async (event) => {
+            if (closing) return;
+            event.preventDefault();
+            closing = true;
+            try {
+              await app.flushNow();
+            } finally {
+              await win.destroy();
+            }
+          });
+        }
 
         const token = localStorage.getItem(SESSION_KEY);
         if (token) {
@@ -154,18 +170,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
       persist: () => state.persist(),
       resetLocalData: () => {
         networkService.stop();
-        const doomed: string[] = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (key && (key.startsWith("lockal.") || key.startsWith("lockal.secure."))) {
-            doomed.push(key);
+        void (async () => {
+          await state.clearHistory();
+          const doomed: string[] = [];
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && (key.startsWith("lockal.") || key.startsWith("lockal.secure."))) {
+              doomed.push(key);
+            }
           }
-        }
-        for (const key of doomed) localStorage.removeItem(key);
-        if (typeof indexedDB !== "undefined") {
-          indexedDB.deleteDatabase("lockalchat-blobs");
-        }
-        window.location.reload();
+          for (const key of doomed) localStorage.removeItem(key);
+          if (typeof indexedDB !== "undefined") {
+            indexedDB.deleteDatabase("lockalchat-blobs");
+          }
+          window.location.reload();
+        })();
       },
     } satisfies AppContextValue;
   }, [state, ready, hasOrganization, auth, localDeviceId]);
@@ -184,9 +203,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
             type="button"
             className="secondary"
             onClick={() => {
-              localStorage.removeItem("lockal.sqlite");
-              localStorage.removeItem(SESSION_KEY);
-              window.location.reload();
+              void (async () => {
+                localStorage.removeItem("lockal.sqlite");
+                localStorage.removeItem(SESSION_KEY);
+                if (isTauri()) {
+                  const { invoke } = await import("@tauri-apps/api/core");
+                  await invoke("delete_history").catch(() => undefined);
+                }
+                window.location.reload();
+              })();
             }}
           >
             Сбросить локальные данные и перезагрузить

@@ -10,6 +10,7 @@ export interface ChatMessagePayload {
   group?: {
     title: string;
     memberUserIds: string[];
+    rosterRevision?: number;
   };
 }
 
@@ -18,6 +19,7 @@ export interface GroupChatPayload {
   title: string;
   memberUserIds: string[];
   createdAt: string;
+  rosterRevision?: number;
 }
 
 export interface ChatAckPayload {

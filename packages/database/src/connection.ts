@@ -7,6 +7,7 @@ import {
   MIGRATION_V5,
   MIGRATION_V6,
   MIGRATION_V7,
+  MIGRATION_V8,
   SCHEMA_VERSION,
 } from "./schema.js";
 
@@ -78,6 +79,11 @@ export class SqliteConnection {
     if (version < 7) {
       this.db.run(MIGRATION_V7);
       version = 7;
+      this.db.run("UPDATE schema_meta SET version = ?", [7]);
+    }
+    if (version < 8) {
+      this.db.run(MIGRATION_V8);
+      version = 8;
       this.db.run("UPDATE schema_meta SET version = ?", [SCHEMA_VERSION]);
     }
   }

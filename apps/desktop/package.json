@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@lockal/application": "*",
+    "@lockal/database": "*",
     "@lockal/domain": "*",
     "@lockal/messaging": "*",
     "@lockal/ui": "*",

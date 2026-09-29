@@ -6,6 +6,7 @@ import { ChatService } from "@lockal/messaging";
 import { InMemoryTransport } from "@lockal/networking";
 import { deviceId, isoNow, organizationId, userId } from "@lockal/shared";
 import { MemoryBlobStore } from "./blob-store.js";
+import { DEFAULT_CHUNK_SIZE } from "./hash-stream.js";
 import { FileTransferEngine } from "./file-transfer-engine.js";
 
 /** Each simulated device gets its own local-first database — mirroring production,
@@ -139,7 +140,7 @@ function fileOfSize(bytes: number): Blob {
 describe("FileTransferEngine", () => {
   it("delivers a multi-chunk file end to end", async () => {
     const { dbA, dbB, chatId, userA, userB, engineA } = await createPair();
-    const file = fileOfSize(64 * 1024 * 2 + 100); // 3 chunks at DEFAULT_CHUNK_SIZE (64KB)
+    const file = fileOfSize(DEFAULT_CHUNK_SIZE * 2 + 100);
 
     const admin = dbA.users.findById(userA)!;
     await engineA.sendFile({
@@ -300,5 +301,31 @@ describe("FileTransferEngine", () => {
       [chatId],
     );
     expect(msg?.status).toBe("failed");
+  });
+
+  it("stores a stub outbox row instead of chunk bytes when the peer is offline", async () => {
+    const { dbA, chatId, userA, userB, transportA, engineA } = await createPair();
+    transportA.setOnline(false);
+    const admin = dbA.users.findById(userA)!;
+    await engineA.sendFile({
+      file: fileOfSize(400),
+      fileName: "brief.docx",
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      chatId,
+      sender: admin,
+      recipientUserId: userB,
+    });
+
+    const rows = dbA.connection.all<{ chunk_index: number; envelope_json: string }>(
+      "SELECT chunk_index, envelope_json FROM file_chunk_outbox WHERE chunk_index >= 0",
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => row.envelope_json === "{}")).toBe(true);
+
+    const sender = dbA.connection.get<{ status: string }>(
+      "SELECT status FROM file_transfers WHERE chat_id = ?",
+      [chatId],
+    );
+    expect(sender?.status).toBe("sending");
   });
 });

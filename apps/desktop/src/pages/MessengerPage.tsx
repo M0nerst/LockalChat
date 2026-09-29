@@ -22,6 +22,30 @@ function formatBubbleTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+const MIME_BY_EXTENSION: Record<string, string> = {
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  pdf: "application/pdf",
+  txt: "text/plain",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  zip: "application/zip",
+};
+
+/** Windows often leaves File.type empty for Word, PowerPoint and Excel. */
+function mimeTypeForFile(file: File): string {
+  if (file.type) return file.type;
+  const ext = file.name.toLowerCase().split(".").pop() ?? "";
+  return MIME_BY_EXTENSION[ext] ?? "application/octet-stream";
+}
+
 /** Telegram-style status marks for the sender's own messages: a clock while
  * still sending, a single check once it's left the device, a double check
  * once the peer's device has it, and a highlighted double check once read.
@@ -98,6 +122,9 @@ export function MessengerPage() {
   const [groupTitle, setGroupTitle] = useState("");
   const [groupMembers, setGroupMembers] = useState<string[]>([]);
   const [groupError, setGroupError] = useState<string | null>(null);
+  const [membersOpen, setMembersOpen] = useState(false);
+  const [editMembers, setEditMembers] = useState<string[]>([]);
+  const [membersError, setMembersError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesAreaRef = useRef<HTMLDivElement>(null);
@@ -124,11 +151,14 @@ export function MessengerPage() {
   );
 
   const peer = userId ? orgUsers.find((u) => u.id === userId) ?? null : null;
-  const group = useMemo(
-    () => (groupId ? chatService.getChat(groupId as never) : null),
+  const group = useMemo(() => {
+    if (!groupId || !auth) return null;
+    const chat = chatService.getChat(groupId as never);
+    if (!chat || chat.kind !== "group") return null;
+    if (!chatService.listMemberIds(chat.id).includes(auth.user.id)) return null;
+    return chat;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [chatService, groupId, tick],
-  );
+  }, [auth, chatService, groupId, tick]);
 
   const chatId = useMemo(() => {
     if (groupId) return groupId as ReturnType<typeof directChatId>;
@@ -215,14 +245,21 @@ export function MessengerPage() {
   async function downloadFile(messageId: string) {
     const file = await networkService.getFileDownloadService().getBlobForMessage(messageId as never);
     if (!file) return;
-    const url = URL.createObjectURL(file.blob);
+    // WebView2 drops or mangles Office MIME types (docx, pptx, xlsx) and a short-lived
+    // object URL cancels a large download before it starts. A generic type plus the
+    // original file name keeps the extension, and the URL stays alive long enough.
+    const blob =
+      file.blob.type === "application/octet-stream"
+        ? file.blob
+        : new Blob([file.blob], { type: "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = file.fileName;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+    window.setTimeout(() => URL.revokeObjectURL(url), 120_000);
   }
 
   function loadOlder() {
@@ -339,7 +376,7 @@ export function MessengerPage() {
       await engine.sendFile({
         file,
         fileName: file.name,
-        mimeType: file.type || "application/octet-stream",
+        mimeType: mimeTypeForFile(file),
         chatId,
         sender: auth.user,
         recipientUserId: recipient,
@@ -386,6 +423,22 @@ export function MessengerPage() {
       navigate(`/group/${id}`);
     } catch (err) {
       setGroupError((err as Error).message);
+    }
+  }
+
+  async function saveGroupMembers() {
+    if (!auth || !group) return;
+    setMembersError(null);
+    try {
+      const previous = chatService.listMemberIds(group.id);
+      const next = [auth.user.id, ...editMembers.filter((id) => id !== auth.user.id)];
+      chatService.replaceGroupMembers(group.id, next as UserId[]);
+      await networkService.getSyncEngine()?.publishGroupChat(group.id, previous);
+      persist();
+      setMembersOpen(false);
+      setTick((v) => v + 1);
+    } catch (err) {
+      setMembersError((err as Error).message);
     }
   }
 
@@ -500,6 +553,19 @@ export function MessengerPage() {
                       {groupMemberLine}
                     </div>
                   </div>
+                  <button
+                    type="button"
+                    className="secondary chat-new-group"
+                    onClick={() => {
+                      setMembersError(null);
+                      setEditMembers(
+                        chatService.listMemberIds(group.id).filter((id) => id !== auth.user.id),
+                      );
+                      setMembersOpen(true);
+                    }}
+                  >
+                    Участники
+                  </button>
                 </>
               ) : peer ? (
                 <>
@@ -695,6 +761,70 @@ export function MessengerPage() {
               </button>
               <button type="button" onClick={() => void createGroup()}>
                 Создать
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {membersOpen && group && (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            setMembersOpen(false);
+            setMembersError(null);
+          }}
+        >
+          <div className="card modal-card" onClick={(e) => e.stopPropagation()}>
+            <h3>Участники</h3>
+            <p className="auth-subtitle" style={{ textAlign: "left" }}>
+              {group.title ?? "Группа"}
+            </p>
+            <ul className="group-member-list">
+              <li>
+                <label className="group-member-row">
+                  <input type="checkbox" checked disabled />
+                  <Avatar id={auth.user.id} name={auth.user.displayName} size={32} avatarUrl={auth.user.avatarUrl} />
+                  <span>{auth.user.displayName} (вы)</span>
+                </label>
+              </li>
+              {orgUsers
+                .filter(
+                  (u) =>
+                    u.id !== auth.user.id &&
+                    (u.status !== "blocked" || editMembers.includes(u.id) || chatService.listMemberIds(group.id).includes(u.id)),
+                )
+                .map((u) => (
+                  <li key={u.id}>
+                    <label className="group-member-row">
+                      <input
+                        type="checkbox"
+                        checked={editMembers.includes(u.id)}
+                        onChange={(e) => {
+                          setEditMembers((prev) =>
+                            e.target.checked ? [...prev, u.id] : prev.filter((id) => id !== u.id),
+                          );
+                        }}
+                      />
+                      <Avatar id={u.id} name={u.displayName} size={32} avatarUrl={u.avatarUrl} />
+                      <span>{u.displayName}</span>
+                    </label>
+                  </li>
+                ))}
+            </ul>
+            {membersError && <p className="error">{membersError}</p>}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => {
+                  setMembersOpen(false);
+                  setMembersError(null);
+                }}
+              >
+                Отмена
+              </button>
+              <button type="button" onClick={() => void saveGroupMembers()}>
+                Сохранить
               </button>
             </div>
           </div>

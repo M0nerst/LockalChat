@@ -79,6 +79,7 @@ export class SyncEngine {
       payload.group = {
         title: chat.title ?? "Группа",
         memberUserIds: this.chats.listMemberIds(message.chatId as never),
+        rosterRevision: this.chats.rosterRevision(message.chatId as never),
       };
     }
     await this.transport.discoverPeers();
@@ -111,7 +112,7 @@ export class SyncEngine {
     );
   }
 
-  async publishGroupChat(chatId: string): Promise<void> {
+  async publishGroupChat(chatId: string, alsoNotifyUserIds: string[] = []): Promise<void> {
     const chat = this.chats.getChat(chatId as never);
     if (!chat || chat.kind !== "group") return;
     const members = this.chats.listMemberIds(chatId as never);
@@ -120,11 +121,13 @@ export class SyncEngine {
       title: chat.title ?? "Группа",
       memberUserIds: members,
       createdAt: isoNow(),
+      rosterRevision: this.chats.rosterRevision(chatId as never),
     };
     await this.transport.discoverPeers();
     const envelope = await this.buildEnvelope("chat.group", payload);
     const repo = this.chats.getMessageRepository();
-    const targets = this.resolveRecipientDeviceIds(chatId);
+    const audience = new Set<string>([...members, ...alsoNotifyUserIds, this.ctx.userId]);
+    const targets = this.resolveDeviceIdsForUsers(audience);
     if (targets.length === 0) {
       repo.enqueueSyncOutbox("", JSON.stringify(envelope));
       return;
@@ -207,7 +210,11 @@ export class SyncEngine {
         recipientIds.add(row.user_id);
       }
     }
+    return this.resolveDeviceIdsForUsers(recipientIds);
+  }
 
+  private resolveDeviceIdsForUsers(userIds: Iterable<string>): string[] {
+    const recipientIds = new Set(userIds);
     const deviceIds = new Set<string>();
     for (const d of this.db.devices.listByOrganization(this.ctx.organizationId as never)) {
       if (recipientIds.has(d.userId) && d.id !== this.ctx.deviceId) {
@@ -291,6 +298,7 @@ export class SyncEngine {
       title: payload.title,
       memberUserIds: payload.memberUserIds as never,
       createdAt: payload.createdAt,
+      rosterRevision: payload.rosterRevision,
     });
     this.onPersist?.();
   }
@@ -309,6 +317,7 @@ export class SyncEngine {
         title: payload.group.title,
         memberUserIds: payload.group.memberUserIds as never,
         updateTitle: false,
+        rosterRevision: payload.group.rosterRevision,
       });
     } else {
       this.chats.ensureChatFromDirectId(this.ctx.organizationId as never, payload.chatId as never);

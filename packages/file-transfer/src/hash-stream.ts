@@ -2,7 +2,7 @@ import { bytesToBase64 } from "@lockal/crypto";
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "@noble/hashes/utils";
 
-export const DEFAULT_CHUNK_SIZE = 64 * 1024;
+export const DEFAULT_CHUNK_SIZE = 256 * 1024;
 
 export async function sha256HexOfBlob(blob: Blob): Promise<string> {
   const buffer = await blob.arrayBuffer();

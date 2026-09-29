@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -20,19 +20,20 @@ pub struct LanNode {
     discovery: DiscoveryHandle,
     connected: Arc<RwLock<HashSet<String>>>,
     peer_writers: Arc<RwLock<HashMap<String, PeerWriter>>>,
-    inbound: broadcast::Sender<(String, WireEnvelope)>,
+    /// UI subscribers. A bounded channel applies backpressure so a fast file
+    /// transfer cannot drop chunks when the webview is still parsing the previous one.
+    inbound_subs: Arc<RwLock<Vec<mpsc::Sender<(String, WireEnvelope)>>>>,
     dial_lock: Arc<Mutex<()>>,
 }
 
 impl LanNode {
     pub fn new(config: DaemonConfig) -> Self {
-        let (inbound, _) = broadcast::channel(256);
         Self {
             config,
             discovery: DiscoveryHandle::new(),
             connected: Arc::new(RwLock::new(HashSet::new())),
             peer_writers: Arc::new(RwLock::new(HashMap::new())),
-            inbound,
+            inbound_subs: Arc::new(RwLock::new(Vec::new())),
             dial_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -177,8 +178,23 @@ impl LanNode {
             if envelope.message_type == "device.hello" {
                 continue;
             }
-            let _ = self.inbound.send((peer_device.clone(), envelope));
+            self.publish_inbound(peer_device.clone(), envelope).await;
         }
+    }
+
+    async fn publish_inbound(&self, peer: String, envelope: WireEnvelope) {
+        let subs = self.inbound_subs.read().await.clone();
+        let mut dead = Vec::new();
+        for tx in subs {
+            if tx.send((peer.clone(), envelope.clone())).await.is_err() {
+                dead.push(tx);
+            }
+        }
+        if dead.is_empty() {
+            return;
+        }
+        let mut guard = self.inbound_subs.write().await;
+        guard.retain(|tx| !dead.iter().any(|gone| gone.same_channel(tx)));
     }
 
     async fn read_hello(
@@ -254,7 +270,8 @@ impl LanNode {
                 let Ok(mut ws) = ws else {
                     return;
                 };
-                let mut inbound = node_conn.inbound.subscribe();
+                let (tx, mut rx) = mpsc::channel::<(String, WireEnvelope)>(8);
+                node_conn.inbound_subs.write().await.push(tx.clone());
                 loop {
                     tokio::select! {
                         msg = ws.next() => {
@@ -268,18 +285,21 @@ impl LanNode {
                                 _ => {}
                             }
                         }
-                        evt = inbound.recv() => {
-                            if let Ok((peer, envelope)) = evt {
-                                let payload = serde_json::json!({
-                                    "type": "envelope.received",
-                                    "peerDeviceId": peer,
-                                    "envelope": envelope,
-                                });
-                                let _ = ws.send(Message::Text(payload.to_string().into())).await;
+                        evt = rx.recv() => {
+                            let Some((peer, envelope)) = evt else { break };
+                            let payload = serde_json::json!({
+                                "type": "envelope.received",
+                                "peerDeviceId": peer,
+                                "envelope": envelope,
+                            });
+                            if ws.send(Message::Text(payload.to_string().into())).await.is_err() {
+                                break;
                             }
                         }
                     }
                 }
+                let mut guard = node_conn.inbound_subs.write().await;
+                guard.retain(|sub| !sub.same_channel(&tx));
             });
         }
     }

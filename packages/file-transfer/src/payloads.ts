@@ -12,6 +12,7 @@ export interface FileMetaPayload {
   group?: {
     title: string;
     memberUserIds: string[];
+    rosterRevision?: number;
   };
 }
 

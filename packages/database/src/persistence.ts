@@ -40,3 +40,27 @@ export function persistDatabase(bytes: Uint8Array): void {
   if (typeof localStorage === "undefined") return;
   localStorage.setItem(STORAGE_KEY, bytesToBase64(bytes));
 }
+
+export function clearPersistedDatabase(): void {
+  if (typeof localStorage === "undefined") return;
+  localStorage.removeItem(STORAGE_KEY);
+}
+
+/** Where the SQLite snapshot lives. Desktop passes a file-backed store;
+ * tests and the browser keep the localStorage copy. */
+export interface HistoryStore {
+  /** When true, `save` finishes before it returns. Used so closing the window cannot drop the last write. */
+  sync?: boolean;
+  load(): Promise<Uint8Array | undefined>;
+  save(bytes: Uint8Array): void | Promise<void>;
+  clear(): void | Promise<void>;
+}
+
+export function browserHistoryStore(): HistoryStore {
+  return {
+    sync: true,
+    load: async () => loadPersistedDatabase(),
+    save: (bytes) => persistDatabase(bytes),
+    clear: () => clearPersistedDatabase(),
+  };
+}

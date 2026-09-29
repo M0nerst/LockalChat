@@ -2,11 +2,12 @@ export function bytesToBase64(bytes: Uint8Array): string {
   if (typeof Buffer !== "undefined") {
     return Buffer.from(bytes).toString("base64");
   }
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
+  const parts: string[] = [];
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    parts.push(String.fromCharCode(...bytes.subarray(i, i + chunk)));
   }
-  return btoa(binary);
+  return btoa(parts.join(""));
 }
 
 export function base64ToBytes(base64: string): Uint8Array {

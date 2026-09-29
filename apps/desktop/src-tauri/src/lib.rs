@@ -75,6 +75,65 @@ async fn save_daemon_config(
     Ok(path.to_string_lossy().into_owned())
 }
 
+fn history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("lockal.sqlite"))
+}
+
+fn read_history(path: &Path) -> Result<Vec<u8>, String> {
+    if path.exists() {
+        return fs::read(path).map_err(|e| e.to_string());
+    }
+    let tmp = path.with_extension("sqlite.tmp");
+    if tmp.exists() {
+        let bytes = fs::read(&tmp).map_err(|e| e.to_string())?;
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::rename(&tmp, path);
+        return Ok(bytes);
+    }
+    Ok(Vec::new())
+}
+
+/// Loads the on-disk history. An empty body means the file does not exist yet.
+#[tauri::command]
+fn load_history(app: tauri::AppHandle) -> Result<tauri::ipc::Response, String> {
+    let path = history_path(&app)?;
+    let bytes = read_history(&path)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Replaces the history file. The body is the raw SQLite bytes.
+#[tauri::command]
+fn save_history(app: tauri::AppHandle, request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected raw history bytes".into());
+    };
+    let path = history_path(&app)?;
+    let tmp = path.with_extension("sqlite.tmp");
+    fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_history(app: tauri::AppHandle) -> Result<(), String> {
+    let path = history_path(&app)?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("sqlite.tmp");
+    if tmp.exists() {
+        fs::remove_file(&tmp).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -83,7 +142,12 @@ pub fn run() {
             started: Mutex::new(false),
             child: Mutex::new(None),
         })
-        .invoke_handler(tauri::generate_handler![save_daemon_config])
+        .invoke_handler(tauri::generate_handler![
+            save_daemon_config,
+            load_history,
+            save_history,
+            delete_history
+        ])
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

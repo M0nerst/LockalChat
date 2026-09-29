@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export const MIGRATION_V1 = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -222,4 +222,9 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_outbox_status ON sync_outbox(status, next_retry_at);
+`;
+
+/** Monotonic roster version so a late message cannot undo a member change. */
+export const MIGRATION_V8 = `
+ALTER TABLE chats ADD COLUMN roster_revision INTEGER NOT NULL DEFAULT 0;
 `;

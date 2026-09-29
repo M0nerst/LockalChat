@@ -38,6 +38,9 @@ export class FileTransferEngine {
   private readonly transfers: TransferRepository;
   private readonly chats: ChatService;
   private receiveBuffers = new Map<string, Blob[]>();
+  /** Transfers where every chunk reached at least one live peer. */
+  private fullyDelivered = new Set<string>();
+  private static readonly MAX_CHUNK_ATTEMPTS = 8;
 
   constructor(
     private readonly db: DatabaseContext,
@@ -164,6 +167,7 @@ export class FileTransferEngine {
           ? {
               title: chat.title ?? "Группа",
               memberUserIds: this.chats.listMemberIds(tr.chatId),
+              rosterRevision: this.chats.rosterRevision(tr.chatId),
             }
           : undefined,
     };
@@ -255,8 +259,16 @@ export class FileTransferEngine {
   async flushOutbox(): Promise<void> {
     const pending = this.transfers.listPendingChunks();
     for (const item of pending) {
+      if (item.attempts >= FileTransferEngine.MAX_CHUNK_ATTEMPTS) {
+        this.transfers.markChunkGaveUp(item.id);
+        continue;
+      }
       try {
-        const envelope = JSON.parse(item.envelopeJson) as ProtocolEnvelope;
+        const envelope = await this.envelopeForOutboxItem(item);
+        if (!envelope) {
+          this.transfers.markChunkGaveUp(item.id);
+          continue;
+        }
         await this.transport.send(item.targetDeviceId, envelope);
         this.transfers.markChunkSent(item.id);
         if (item.chunkIndex >= 0) {
@@ -276,13 +288,48 @@ export class FileTransferEngine {
       if (!tr || tr.status !== "sending") continue;
       if (tr.nextChunkIndex < tr.totalChunks) continue;
       if (this.transfers.hasPendingOutbox(transferId)) continue;
-      this.transfers.markCompleted(transferId);
-      if (tr.messageId) {
-        this.db.connection.exec(
-          "UPDATE messages SET status = ? WHERE id = ? AND status = ?",
-          [MessageDeliveryStatus.Sent, tr.messageId, MessageDeliveryStatus.Sending],
-        );
+      if (this.fullyDelivered.has(transferId) || this.transfers.hasSentChunk(transferId)) {
+        this.markTransferSent(transferId, tr.messageId);
+      } else {
+        this.transfers.setStatus(transferId, "failed");
+        if (tr.messageId) {
+          this.db.connection.exec(
+            "UPDATE messages SET status = ? WHERE id = ? AND status = ?",
+            [MessageDeliveryStatus.Failed, tr.messageId, MessageDeliveryStatus.Sending],
+          );
+        }
       }
+    }
+  }
+
+  /** Chunk bytes stay in the blob store. The outbox row only remembers who still needs them. */
+  private async envelopeForOutboxItem(item: {
+    transferId: string;
+    chunkIndex: number;
+    envelopeJson: string;
+  }): Promise<ProtocolEnvelope | null> {
+    if (item.chunkIndex < 0) {
+      return JSON.parse(item.envelopeJson) as ProtocolEnvelope;
+    }
+    const tr = this.transfers.get(item.transferId);
+    const blob = await this.blobStore.get(item.transferId);
+    if (!tr || !blob) return null;
+    const dataBase64 = await readFileChunkBase64(blob, item.chunkIndex, tr.chunkSize);
+    return this.signEnvelope("file.chunk", {
+      transferId: item.transferId,
+      chunkIndex: item.chunkIndex,
+      dataBase64,
+    });
+  }
+
+  private markTransferSent(transferId: string, messageId: string | null): void {
+    this.transfers.markCompleted(transferId);
+    this.fullyDelivered.delete(transferId);
+    if (messageId) {
+      this.db.connection.exec(
+        "UPDATE messages SET status = ? WHERE id = ? AND status = ?",
+        [MessageDeliveryStatus.Sent, messageId, MessageDeliveryStatus.Sending],
+      );
     }
   }
 
@@ -328,6 +375,7 @@ export class FileTransferEngine {
           title: meta.group.title,
           memberUserIds: meta.group.memberUserIds as never,
           updateTitle: false,
+          rosterRevision: meta.group.rosterRevision,
         });
       }
     } else {
@@ -398,7 +446,11 @@ export class FileTransferEngine {
 
   private async finalizeReceive(transferId: string, tr: NonNullable<ReturnType<TransferRepository["get"]>>): Promise<void> {
     const parts = this.receiveBuffers.get(transferId) ?? [];
-    const blob = new Blob(parts.filter(Boolean) as Blob[], { type: tr.mimeType });
+    if (parts.length !== tr.totalChunks || parts.some((part) => !part)) {
+      this.transfers.updateProgress(transferId, tr.nextChunkIndex, "failed");
+      return;
+    }
+    const blob = new Blob(parts, { type: tr.mimeType });
     const hash = await sha256HexOfFile(blob);
     if (hash !== tr.sha256Hex) {
       this.transfers.updateProgress(transferId, tr.nextChunkIndex, "failed");
@@ -426,28 +478,29 @@ export class FileTransferEngine {
   ): Promise<void> {
     const tr = this.transfers.get(transferId);
     if (!tr) return;
+    const sendingRange = fromIndex < tr.totalChunks;
+    let live = sendingRange;
     for (let i = fromIndex; i < tr.totalChunks; i++) {
       const current = this.transfers.get(transferId);
       if (!current || current.status === "paused" || current.status === "cancelled") return;
       const dataBase64 = await readFileChunkBase64(file, i, tr.chunkSize);
       const chunk: FileChunkPayload = { transferId, chunkIndex: i, dataBase64 };
       const env = await this.signEnvelope("file.chunk", chunk);
-      await this.broadcastToPeers(recipientUserId, env, (deviceId, envelope) => {
-        this.transfers.enqueueChunkOutbox(transferId, i, deviceId, JSON.stringify(envelope));
+      const delivered = await this.broadcastToPeers(recipientUserId, env, (deviceId) => {
+        this.transfers.enqueueChunkOutbox(transferId, i, deviceId, "{}");
       }, tr.chatId);
+      if (delivered === 0) live = false;
       this.transfers.updateProgress(transferId, i + 1, "sending");
     }
+    if (live) this.fullyDelivered.add(transferId);
     await this.flushOutbox();
     const finalStatus = this.transfers.get(transferId)?.status;
     if (finalStatus === "paused" || finalStatus === "cancelled") return;
-    if (!this.transfers.hasPendingOutbox(transferId)) {
-      this.transfers.markCompleted(transferId);
-      if (tr.messageId) {
-        this.db.connection.exec("UPDATE messages SET status = ? WHERE id = ?", [
-          MessageDeliveryStatus.Sent,
-          tr.messageId,
-        ]);
-      }
+    if (
+      this.fullyDelivered.has(transferId) ||
+      (!this.transfers.hasPendingOutbox(transferId) && this.transfers.hasSentChunk(transferId))
+    ) {
+      this.markTransferSent(transferId, tr.messageId);
     }
   }
 
@@ -484,7 +537,7 @@ export class FileTransferEngine {
     envelope: ProtocolEnvelope,
     onQueue: (deviceId: DeviceId, env: ProtocolEnvelope) => void,
     chatId?: string,
-  ): Promise<void> {
+  ): Promise<number> {
     await this.transport.discoverPeers();
     const targets = this.collectTargetDevices(recipientUserId, chatId);
     if (targets.length === 0) {
@@ -494,15 +547,18 @@ export class FileTransferEngine {
           if (d.id !== this.ctx.deviceId) onQueue(d.id, envelope);
         }
       }
-      return;
+      return 0;
     }
+    let delivered = 0;
     for (const deviceId of targets) {
       try {
         await this.transport.send(deviceId, envelope);
+        delivered++;
       } catch {
         onQueue(deviceId, envelope);
       }
     }
+    return delivered;
   }
 
   private async signEnvelope(messageType: ProtocolEnvelope["messageType"], payload: unknown) {

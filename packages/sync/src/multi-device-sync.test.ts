@@ -344,4 +344,34 @@ describe("Multi-device sync", () => {
     const status = new ChatService(dbA1).listMessages(chatId).find((m) => m.id === msg.id)?.status;
     expect(status === MessageDeliveryStatus.Sent || status === MessageDeliveryStatus.Delivered).toBe(true);
   });
+
+  it("removes a group member on the peer and keeps a stale roster from restoring them", async () => {
+    const { dbA1, dbB1, orgId, alice, bob, engineA1 } = await createThreeDevicePair();
+    const cara = userId();
+    const chats = new ChatService(dbA1);
+    const groupId = chats.createGroupChat({
+      organizationId: orgId,
+      creatorId: alice,
+      title: "Отдел",
+      memberUserIds: [bob, cara],
+    });
+    await engineA1.publishGroupChat(groupId);
+    await new Promise((r) => setTimeout(r, 40));
+    expect(new ChatService(dbB1).listMemberIds(groupId).sort()).toEqual([alice, bob, cara].sort());
+
+    const previous = chats.listMemberIds(groupId);
+    chats.replaceGroupMembers(groupId, [alice, bob]);
+    await engineA1.publishGroupChat(groupId, previous);
+    await new Promise((r) => setTimeout(r, 40));
+    expect(new ChatService(dbB1).listMemberIds(groupId).sort()).toEqual([alice, bob].sort());
+
+    new ChatService(dbB1).upsertGroupChat({
+      organizationId: orgId,
+      chatId: groupId,
+      title: "Отдел",
+      memberUserIds: [alice, bob, cara],
+      rosterRevision: 1,
+    });
+    expect(new ChatService(dbB1).listMemberIds(groupId).sort()).toEqual([alice, bob].sort());
+  });
 });

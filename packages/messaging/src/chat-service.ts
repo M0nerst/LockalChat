@@ -58,7 +58,43 @@ export class ChatService {
         [id, uid, now],
       );
     }
+    this.db.connection.exec("UPDATE chats SET roster_revision = 1 WHERE id = ?", [id]);
     return id;
+  }
+
+  /** Replaces the member list of an existing group and bumps its roster revision. */
+  replaceGroupMembers(chatId: ChatId, memberUserIds: UserId[]): number {
+    const chat = this.getChat(chatId);
+    if (!chat || chat.kind !== "group") throw new Error("Это не группа");
+    const members = [...new Set(memberUserIds)];
+    if (members.length < 2) throw new Error("В группе должно остаться хотя бы два участника");
+    const now = isoNow();
+    const revision = this.rosterRevision(chatId) + 1;
+    const placeholders = members.map(() => "?").join(", ");
+    this.db.connection.exec(
+      `DELETE FROM chat_members WHERE chat_id = ? AND user_id NOT IN (${placeholders})`,
+      [chatId, ...members],
+    );
+    for (const uid of members) {
+      this.db.connection.exec(
+        "INSERT OR IGNORE INTO chat_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)",
+        [chatId, uid, now],
+      );
+    }
+    this.db.connection.exec("UPDATE chats SET roster_revision = ?, updated_at = ? WHERE id = ?", [
+      revision,
+      now,
+      chatId,
+    ]);
+    return revision;
+  }
+
+  rosterRevision(chatId: ChatId): number {
+    const row = this.db.connection.get<{ roster_revision: number | null }>(
+      "SELECT roster_revision FROM chats WHERE id = ?",
+      [chatId],
+    );
+    return Number(row?.roster_revision) || 0;
   }
 
   /** Creates or refreshes a group that arrived from another device. */
@@ -70,6 +106,8 @@ export class ChatService {
     createdAt?: string;
     /** When false, an existing group's title is left alone (message retries must not rename it). */
     updateTitle?: boolean;
+    /** Newer snapshots replace the member list. Older ones are ignored. */
+    rosterRevision?: number;
   }): void {
     if (!input.chatId.startsWith("grp_")) return;
     const title = input.title.trim();
@@ -90,11 +128,29 @@ export class ChatService {
         input.chatId,
       ]);
     }
-    for (const uid of input.memberUserIds) {
-      this.db.connection.exec(
-        "INSERT OR IGNORE INTO chat_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)",
-        [input.chatId, uid, now],
-      );
+    const incomingRevision = input.rosterRevision ?? 0;
+    const storedRevision = existing ? this.rosterRevision(input.chatId) : 0;
+    const applyMembers = !existing || (incomingRevision > 0 && incomingRevision > storedRevision);
+    if (applyMembers && input.memberUserIds.length > 0) {
+      if (existing) {
+        const placeholders = input.memberUserIds.map(() => "?").join(", ");
+        this.db.connection.exec(
+          `DELETE FROM chat_members WHERE chat_id = ? AND user_id NOT IN (${placeholders})`,
+          [input.chatId, ...input.memberUserIds],
+        );
+      }
+      for (const uid of input.memberUserIds) {
+        this.db.connection.exec(
+          "INSERT OR IGNORE INTO chat_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)",
+          [input.chatId, uid, now],
+        );
+      }
+      if (incomingRevision > storedRevision) {
+        this.db.connection.exec("UPDATE chats SET roster_revision = ? WHERE id = ?", [
+          incomingRevision,
+          input.chatId,
+        ]);
+      }
     }
   }
 

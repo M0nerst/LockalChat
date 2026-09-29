@@ -183,4 +183,40 @@ describe("ChatService unread / markChatRead", () => {
     expect(chat.hasMessagesBefore(chatId, page[0]!.createdAt)).toBe(true);
     expect(chat.hasMessagesBefore(chatId, chat.listMessages(chatId, 3)[0]!.createdAt)).toBe(false);
   });
+
+  it("replaces group members and ignores an older roster snapshot", async () => {
+    const db = await createDb();
+    const chat = new ChatService(db);
+    const orgId = organizationId();
+    const alice = userId();
+    const bob = userId();
+    const cara = userId();
+    const id = chat.createGroupChat({
+      organizationId: orgId,
+      creatorId: alice,
+      title: "Отдел",
+      memberUserIds: [bob, cara],
+    });
+    expect(chat.rosterRevision(id)).toBe(1);
+    const revision = chat.replaceGroupMembers(id, [alice, bob]);
+    expect(revision).toBe(2);
+    expect(chat.listMemberIds(id).sort()).toEqual([alice, bob].sort());
+    chat.upsertGroupChat({
+      organizationId: orgId,
+      chatId: id,
+      title: "Отдел",
+      memberUserIds: [alice, bob, cara],
+      rosterRevision: 1,
+    });
+    expect(chat.listMemberIds(id).sort()).toEqual([alice, bob].sort());
+    chat.upsertGroupChat({
+      organizationId: orgId,
+      chatId: id,
+      title: "Отдел",
+      memberUserIds: [alice, cara],
+      rosterRevision: 3,
+    });
+    expect(chat.listMemberIds(id).sort()).toEqual([alice, cara].sort());
+    expect(() => chat.replaceGroupMembers(id, [alice])).toThrow(/два участника/);
+  });
 });

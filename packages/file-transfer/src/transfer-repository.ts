@@ -189,7 +189,7 @@ export class TransferRepository {
         `SELECT o.id, o.transfer_id, o.chunk_index, o.target_device_id, o.envelope_json, o.attempts
          FROM file_chunk_outbox o
          JOIN file_transfers t ON t.id = o.transfer_id
-         WHERE o.status = 'pending' AND o.next_retry_at <= ? AND t.status = 'sending'
+         WHERE o.status = 'pending' AND o.next_retry_at <= ? AND t.status IN ('sending', 'completed')
          LIMIT ?`,
         [now, limit],
       )
@@ -213,5 +213,17 @@ export class TransferRepository {
       "UPDATE file_chunk_outbox SET attempts = ?, next_retry_at = ? WHERE id = ?",
       [attempts + 1, next, id],
     );
+  }
+
+  markChunkGaveUp(id: string): void {
+    this.db.connection.exec("UPDATE file_chunk_outbox SET status = 'failed' WHERE id = ?", [id]);
+  }
+
+  hasSentChunk(transferId: string): boolean {
+    const row = this.db.connection.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM file_chunk_outbox WHERE transfer_id = ? AND chunk_index >= 0 AND status = 'sent'",
+      [transferId],
+    );
+    return (Number(row?.n) || 0) > 0;
   }
 }
