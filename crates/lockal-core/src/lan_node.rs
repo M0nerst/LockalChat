@@ -5,6 +5,7 @@ use crate::protocol::{
 };
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
@@ -12,18 +13,28 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-type PeerWriter = mpsc::Sender<Vec<u8>>;
+/// Chat and presence use `high`. File chunks use `low` so a large transfer
+/// cannot fill the TCP socket ahead of everything else.
+struct PeerQueues {
+    high: mpsc::Sender<Vec<u8>>,
+    low: mpsc::Sender<Vec<u8>>,
+}
+
+/// Pause after each file chunk so one transfer does not saturate the LAN.
+const FILE_CHUNK_GAP: std::time::Duration = std::time::Duration::from_millis(12);
 
 #[derive(Clone)]
 pub struct LanNode {
     config: DaemonConfig,
     discovery: DiscoveryHandle,
     connected: Arc<RwLock<HashSet<String>>>,
-    peer_writers: Arc<RwLock<HashMap<String, PeerWriter>>>,
+    peer_writers: Arc<RwLock<HashMap<String, PeerQueues>>>,
     /// UI subscribers. A bounded channel applies backpressure so a fast file
     /// transfer cannot drop chunks when the webview is still parsing the previous one.
     inbound_subs: Arc<RwLock<Vec<mpsc::Sender<(String, WireEnvelope)>>>>,
     dial_lock: Arc<Mutex<()>>,
+    /// UI `discovery.refresh` must not pile up. Each one dials offline peers.
+    refresh_inflight: Arc<AtomicBool>,
 }
 
 impl LanNode {
@@ -35,6 +46,7 @@ impl LanNode {
             peer_writers: Arc::new(RwLock::new(HashMap::new())),
             inbound_subs: Arc::new(RwLock::new(Vec::new())),
             dial_lock: Arc::new(Mutex::new(())),
+            refresh_inflight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -144,11 +156,16 @@ impl LanNode {
         device_id: &str,
         writer: OwnedWriteHalf,
     ) -> Result<(), String> {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
-        self.peer_writers
-            .write()
-            .await
-            .insert(device_id.to_string(), tx);
+        let (high_tx, mut high_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (low_tx, mut low_rx) = mpsc::channel::<Vec<u8>>(4);
+        let identity = high_tx.clone();
+        self.peer_writers.write().await.insert(
+            device_id.to_string(),
+            PeerQueues {
+                high: high_tx,
+                low: low_tx,
+            },
+        );
         self.connected.write().await.insert(device_id.to_string());
 
         let device_id_owned = device_id.to_string();
@@ -156,13 +173,47 @@ impl LanNode {
         let connected = self.connected.clone();
         tokio::spawn(async move {
             let mut writer = writer;
-            while let Some(bytes) = rx.recv().await {
-                if write_frame(&mut writer, &bytes).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    biased;
+                    frame = high_rx.recv() => {
+                        let Some(frame) = frame else { break };
+                        if write_frame(&mut writer, &frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    frame = low_rx.recv() => {
+                        let Some(frame) = frame else { break };
+                        if write_frame(&mut writer, &frame).await.is_err() {
+                            break;
+                        }
+                        // Chat that arrives during the gap goes out before the next chunk.
+                        let gap = tokio::time::sleep(FILE_CHUNK_GAP);
+                        tokio::pin!(gap);
+                        tokio::select! {
+                            biased;
+                            frame = high_rx.recv() => {
+                                let Some(frame) = frame else { break };
+                                if write_frame(&mut writer, &frame).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ = &mut gap => {}
+                        }
+                    }
                 }
             }
-            peer_writers.write().await.remove(&device_id_owned);
-            connected.write().await.remove(&device_id_owned);
+            // A replaced session must not let the old writer task drop the new one.
+            let mut guard = peer_writers.write().await;
+            let still_ours = guard
+                .get(&device_id_owned)
+                .map(|queues| queues.high.same_channel(&identity))
+                .unwrap_or(false);
+            if still_ours {
+                guard.remove(&device_id_owned);
+                drop(guard);
+                connected.write().await.remove(&device_id_owned);
+            }
         });
         Ok(())
     }
@@ -242,16 +293,24 @@ impl LanNode {
     }
 
     pub async fn send_to_peer(&self, device_id: &str, envelope: WireEnvelope) -> Result<(), String> {
+        let bulk = envelope.message_type == "file.chunk" || envelope.message_type == "file.relay";
         let bytes = serialize_envelope(&envelope).map_err(|e| e.to_string())?;
-        let tx = self
+        let queues = self
             .peer_writers
             .read()
             .await
             .get(device_id)
-            .cloned()
+            .map(|q| PeerQueues {
+                high: q.high.clone(),
+                low: q.low.clone(),
+            })
             .ok_or_else(|| format!("peer {device_id} not connected"))?;
-        tx.send(bytes)
-            .await
+        let send = if bulk {
+            queues.low.send(bytes)
+        } else {
+            queues.high.send(bytes)
+        };
+        send.await
             .map_err(|_| format!("peer {device_id} write channel closed"))
     }
 
@@ -270,7 +329,8 @@ impl LanNode {
                 let Ok(mut ws) = ws else {
                     return;
                 };
-                let (tx, mut rx) = mpsc::channel::<(String, WireEnvelope)>(8);
+                let (tx, mut rx) = mpsc::channel::<(String, WireEnvelope)>(32);
+                let (out_tx, mut out_rx) = mpsc::channel::<Message>(32);
                 node_conn.inbound_subs.write().await.push(tx.clone());
                 loop {
                     tokio::select! {
@@ -278,7 +338,33 @@ impl LanNode {
                             match msg {
                                 Some(Ok(Message::Text(text))) => {
                                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                        node_conn.handle_ui_command(&v, &mut ws).await;
+                                        if v.get("type").and_then(|t| t.as_str()) == Some("envelope.send") {
+                                            // Peer writes can block when the other side is still
+                                            // reading a large file. That wait must not stop this
+                                            // socket from delivering incoming chunks.
+                                            let node = node_conn.clone();
+                                            let reply = out_tx.clone();
+                                            tokio::spawn(async move {
+                                                let device_id = v.get("deviceId").and_then(|id| id.as_str()).unwrap_or("").to_string();
+                                                let request_id = v.get("requestId").cloned().unwrap_or(serde_json::Value::Null);
+                                                let parsed = serde_json::from_value::<WireEnvelope>(
+                                                    v.get("envelope").cloned().unwrap_or_default(),
+                                                );
+                                                let result = match parsed {
+                                                    Ok(envelope) => node.send_to_peer(&device_id, envelope).await,
+                                                    Err(e) => Err(format!("invalid envelope: {e}")),
+                                                };
+                                                let resp = serde_json::json!({
+                                                    "type": "envelope.send.result",
+                                                    "requestId": request_id,
+                                                    "ok": result.is_ok(),
+                                                    "error": result.err(),
+                                                });
+                                                let _ = reply.send(Message::Text(resp.to_string().into())).await;
+                                            });
+                                        } else {
+                                            node_conn.handle_ui_command(&v, &mut ws).await;
+                                        }
                                     }
                                 }
                                 Some(Ok(Message::Close(_))) | None => break,
@@ -293,6 +379,12 @@ impl LanNode {
                                 "envelope": envelope,
                             });
                             if ws.send(Message::Text(payload.to_string().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        outgoing = out_rx.recv() => {
+                            let Some(message) = outgoing else { break };
+                            if ws.send(message).await.is_err() {
                                 break;
                             }
                         }
@@ -320,24 +412,20 @@ impl LanNode {
                 });
                 let _ = ws.send(Message::Text(resp.to_string().into())).await;
             }
-            Some("envelope.send") => {
-                let device_id = cmd.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
-                let parse_result = serde_json::from_value::<WireEnvelope>(
-                    cmd.get("envelope").cloned().unwrap_or_default(),
-                );
-                let result = match parse_result {
-                    Ok(envelope) => self.send_to_peer(device_id, envelope).await,
-                    Err(e) => Err(format!("invalid envelope: {e}")),
-                };
-                let resp = serde_json::json!({
-                    "type": "envelope.send.result",
-                    "ok": result.is_ok(),
-                    "error": result.err().map(|s| s.to_string()),
-                });
-                let _ = ws.send(Message::Text(resp.to_string().into())).await;
-            }
             Some("discovery.refresh") => {
-                self.refresh_connections().await;
+                // Dialing offline peers can take seconds. Doing it on this task
+                // stops inbound file chunks and chat until the dials finish.
+                if self
+                    .refresh_inflight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let node = self.clone();
+                    tokio::spawn(async move {
+                        node.refresh_connections().await;
+                        node.refresh_inflight.store(false, Ordering::Release);
+                    });
+                }
             }
             _ => {}
         }

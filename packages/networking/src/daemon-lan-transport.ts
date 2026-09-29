@@ -18,10 +18,12 @@ export class DaemonLanTransport implements NetworkTransport {
   private handlers = new Set<(peer: string, env: ProtocolEnvelope) => void>();
   private connected = new Set<string>();
   private sendChain: Promise<void> = Promise.resolve();
-  private pendingSend: {
-    resolve: () => void;
-    reject: (err: Error) => void;
-  } | null = null;
+  /** File bytes are queued per peer so one stuck computer cannot block the others. */
+  private bulkChains = new Map<string, Promise<void>>();
+  private pendingSend = new Map<
+    string,
+    { resolve: () => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
+  >();
 
   constructor(wsUrl = DaemonLanTransport.defaultWsUrl()) {
     this.wsUrl = wsUrl;
@@ -60,9 +62,10 @@ export class DaemonLanTransport implements NetworkTransport {
       ws.onmessage = (evt) => this.handleMessage(String(evt.data));
       ws.onclose = () => {
         this.ws = null;
-        if (this.pendingSend) {
-          this.pendingSend.reject(new Error("Соединение с LAN-сервисом разорвано"));
-          this.pendingSend = null;
+        for (const [id, pending] of this.pendingSend) {
+          clearTimeout(pending.timer);
+          pending.reject(new Error("Соединение с LAN-сервисом разорвано"));
+          this.pendingSend.delete(id);
         }
       };
     });
@@ -101,9 +104,11 @@ export class DaemonLanTransport implements NetworkTransport {
       return;
     }
     if (type === "envelope.send.result") {
-      const pending = this.pendingSend;
+      const requestId = String(data.requestId ?? "");
+      const pending = this.pendingSend.get(requestId);
       if (pending) {
-        this.pendingSend = null;
+        this.pendingSend.delete(requestId);
+        clearTimeout(pending.timer);
         if (data.ok) pending.resolve();
         else pending.reject(new Error(String(data.error ?? "send failed")));
       }
@@ -138,8 +143,14 @@ export class DaemonLanTransport implements NetworkTransport {
   async disconnect(_peerDeviceId: string): Promise<void> {}
 
   async send(peerDeviceId: string, envelope: ProtocolEnvelope): Promise<void> {
-    const job = this.sendChain.catch(() => undefined).then(() => this.sendOnce(peerDeviceId, envelope));
-    this.sendChain = job.catch(() => undefined);
+    const bulk = envelope.messageType === "file.chunk" || envelope.messageType === "file.relay";
+    const previous = bulk
+      ? (this.bulkChains.get(peerDeviceId) ?? Promise.resolve())
+      : this.sendChain;
+    const job = previous.catch(() => undefined).then(() => this.sendOnce(peerDeviceId, envelope));
+    const settled = job.catch(() => undefined);
+    if (bulk) this.bulkChains.set(peerDeviceId, settled);
+    else this.sendChain = settled;
     return job;
   }
 
@@ -150,39 +161,29 @@ export class DaemonLanTransport implements NetworkTransport {
       this.resetConnection();
       throw err;
     }
+    const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     await new Promise<void>((resolve, reject) => {
-      const slot = {
-        resolve: () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        reject: (err: Error) => {
-          clearTimeout(timer);
-          reject(err);
-        },
-      };
-      this.pendingSend = slot;
       const timer = setTimeout(() => {
-        if (this.pendingSend === slot) {
-          this.pendingSend = null;
-          reject(new Error("LAN send timeout (peer not connected?)"));
-        }
-      }, 12_000);
+        if (!this.pendingSend.has(requestId)) return;
+        this.pendingSend.delete(requestId);
+        // The socket itself is still healthy. Closing it here used to drop
+        // every file chunk the other computer had not finished reading.
+        reject(new Error("LAN send timeout (peer not connected?)"));
+      }, 60_000);
+      this.pendingSend.set(requestId, { resolve, reject, timer });
       try {
         this.sendCommand({
           type: "envelope.send",
+          requestId,
           deviceId: peerDeviceId,
           envelope,
         });
       } catch (err) {
-        this.pendingSend = null;
         clearTimeout(timer);
+        this.pendingSend.delete(requestId);
         this.resetConnection();
         reject(err instanceof Error ? err : new Error(String(err)));
       }
-    }).catch((err) => {
-      this.resetConnection();
-      throw err;
     });
   }
 

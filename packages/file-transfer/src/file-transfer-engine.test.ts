@@ -128,7 +128,7 @@ async function createPair() {
   transportA.onReceive((_peer, env) => void engineA.handleEnvelope(env));
   transportB.onReceive((_peer, env) => void engineB.handleEnvelope(env));
 
-  return { dbA, dbB, chatId, userA, userB, transportA, transportB, engineA, engineB };
+  return { dbA, dbB, chatId, userA, userB, devA, devB, orgId, transportA, transportB, engineA, engineB };
 }
 
 function fileOfSize(bytes: number): Blob {
@@ -327,5 +327,92 @@ describe("FileTransferEngine", () => {
       [chatId],
     );
     expect(sender?.status).toBe("sending");
+  });
+
+  it("still delivers when an old device of the recipient is not on the network", async () => {
+    const { dbA, dbB, chatId, userA, userB, engineA } = await createPair();
+    const now = isoNow();
+    const org = dbA.organizations.getFirst()!;
+    const stale = deviceId();
+    dbA.devices.create({
+      id: stale,
+      userId: userB,
+      organizationId: org.id,
+      name: "old-laptop",
+      platform: "test",
+      appVersion: "0.1.0",
+      publicKey: "c3RhbGU",
+      fingerprint: "stale",
+      trustStatus: DeviceTrustStatus.Trusted,
+      lastSeenAt: now,
+      lastIp: null,
+      createdAt: now,
+    });
+
+    const admin = dbA.users.findById(userA)!;
+    await engineA.sendFile({
+      file: fileOfSize(200),
+      fileName: "notes.txt",
+      mimeType: "text/plain",
+      chatId,
+      sender: admin,
+      recipientUserId: userB,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    const receiver = dbB.connection.get<{ status: string }>(
+      "SELECT status FROM file_transfers WHERE chat_id = ?",
+      [chatId],
+    );
+    expect(receiver?.status).toBe("completed");
+    const queued = dbA.connection.get<{ n: number }>(
+      "SELECT COUNT(*) as n FROM file_chunk_outbox WHERE target_device_id = ? AND status = 'pending'",
+      [stale],
+    );
+    expect(queued?.n ?? 0).toBeGreaterThan(0);
+  });
+
+  it("forwards the file through another online computer when the direct link is down", async () => {
+    const { dbA, dbB, chatId, userA, userB, devB, transportA, engineA } = await createPair();
+    const relayDevice = deviceId();
+    const relayUser = userId();
+    const relayKeys = await generateIdentityKeyPair();
+    const transportC = new InMemoryTransport(relayDevice, {
+      deviceId: relayDevice,
+      userId: relayUser,
+      publicKey: relayKeys.publicKey,
+      addresses: [],
+      lastSeenAt: isoNow(),
+      trusted: true,
+    });
+    const engineC = new FileTransferEngine(dbA, transportC, new MemoryBlobStore(), {
+      deviceId: relayDevice,
+      devicePrivateKey: relayKeys.privateKey,
+      userId: relayUser,
+    });
+    transportC.onReceive((_peer, env) => void engineC.handleEnvelope(env));
+    transportA.blockPeer(devB);
+
+    const admin = dbA.users.findById(userA)!;
+    await engineA.sendFile({
+      file: fileOfSize(300),
+      fileName: "via-relay.bin",
+      mimeType: "application/octet-stream",
+      chatId,
+      sender: admin,
+      recipientUserId: userB,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    const receiver = dbB.connection.get<{ status: string }>(
+      "SELECT status FROM file_transfers WHERE chat_id = ?",
+      [chatId],
+    );
+    expect(receiver?.status).toBe("completed");
+    const sender = dbA.connection.get<{ status: string }>(
+      "SELECT status FROM file_transfers WHERE chat_id = ? AND sender_user_id = ?",
+      [chatId, userA],
+    );
+    expect(sender?.status).toBe("completed");
   });
 });

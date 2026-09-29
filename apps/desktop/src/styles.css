@@ -613,6 +613,18 @@ button.secondary:active {
   background: var(--bg);
 }
 
+.conversation-panel.drop-active {
+  outline: 2px dashed var(--border);
+  outline-offset: -8px;
+}
+
+.drop-hint {
+  align-self: center;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .conversation-empty {
   flex: 1;
   display: flex;

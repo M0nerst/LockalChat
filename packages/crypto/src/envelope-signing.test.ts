@@ -50,4 +50,24 @@ describe("Envelope signing", () => {
     };
     expect(await verifyEnvelope(keys.publicKey, relayed)).toBe(true);
   });
+
+  it("verifies a payload after JSON drops undefined fields (direct file meta)", async () => {
+    const keys = await generateIdentityKeyPair();
+    const envelope = createEnvelope({
+      messageType: "file.meta",
+      messageId: "msg_file",
+      senderDeviceId: "dev_test",
+      nonce: "n3",
+      payload: {
+        transferId: "xfr_1",
+        chatId: "dm_usr_a_usr_b",
+        fileName: "note.txt",
+        group: undefined,
+      },
+    });
+    envelope.signature = await signEnvelope(keys.privateKey, envelope);
+    const relayed = JSON.parse(JSON.stringify(envelope)) as typeof envelope;
+    expect(relayed.payload).not.toHaveProperty("group");
+    expect(await verifyEnvelope(keys.publicKey, relayed)).toBe(true);
+  });
 });

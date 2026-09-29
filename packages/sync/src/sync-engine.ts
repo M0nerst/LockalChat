@@ -275,6 +275,7 @@ export class SyncEngine {
       case "file.chunk":
       case "file.complete":
       case "file.resume":
+      case "file.relay":
         await this.fileTransfer?.handleEnvelope(envelope);
         this.onPersist?.();
         break;

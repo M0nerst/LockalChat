@@ -13,6 +13,7 @@ export type MessageType =
   | "file.chunk"
   | "file.complete"
   | "file.resume"
+  | "file.relay"
   | "call.signal"
   | "sync.envelope";
 

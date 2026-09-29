@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, Navigate, useNavigate, useParams } from "react-router-dom";
 import { MessageDeliveryStatus } from "@lockal/domain";
@@ -50,6 +50,26 @@ function mimeTypeForFile(file: File): string {
  * still sending, a single check once it's left the device, a double check
  * once the peer's device has it, and a highlighted double check once read.
  * Failed messages are clickable so the user can retry. */
+/** A file bubble follows the transfer, not the message row. The row can say
+ * "sent" while chunks are still on the wire. */
+function bubbleDeliveryStatus(
+  messageStatus: MessageDeliveryStatus,
+  transferStatus?: string | null,
+): MessageDeliveryStatus {
+  if (
+    transferStatus === "sending" ||
+    transferStatus === "pending" ||
+    transferStatus === "paused" ||
+    transferStatus === "receiving"
+  ) {
+    return MessageDeliveryStatus.Sending;
+  }
+  if (transferStatus === "failed" || transferStatus === "cancelled") {
+    return MessageDeliveryStatus.Failed;
+  }
+  return messageStatus;
+}
+
 function DeliveryMark({
   status,
   onRetry,
@@ -117,6 +137,7 @@ export function MessengerPage() {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [historyLimits, setHistoryLimits] = useState<Record<string, number>>({});
   const [uploading, setUploading] = useState(false);
+  const [dropActive, setDropActive] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [groupOpen, setGroupOpen] = useState(false);
   const [groupTitle, setGroupTitle] = useState("");
@@ -392,6 +413,44 @@ export function MessengerPage() {
     }
   }
 
+  async function sendFiles(files: File[]) {
+    for (const file of files) await onFileSelected(file);
+  }
+
+  function onFileDrag(event: DragEvent) {
+    if (![...event.dataTransfer.types].includes("Files")) return;
+    event.preventDefault();
+    if (!chatId || peer?.status === "blocked") return;
+    setDropActive(true);
+  }
+
+  function onFileDragLeave(event: DragEvent) {
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setDropActive(false);
+  }
+
+  function onFileDrop(event: DragEvent) {
+    event.preventDefault();
+    setDropActive(false);
+    if (!chatId || peer?.status === "blocked" || uploading) return;
+    void sendFiles([...event.dataTransfer.files]);
+  }
+
+  function onPasteFiles(event: ClipboardEvent) {
+    const pasted = [...event.clipboardData.files];
+    if (pasted.length === 0) {
+      for (const item of event.clipboardData.items) {
+        if (item.kind !== "file") continue;
+        const file = item.getAsFile();
+        if (file) pasted.push(file);
+      }
+    }
+    if (pasted.length === 0) return;
+    event.preventDefault();
+    if (peer?.status === "blocked" || uploading) return;
+    void sendFiles(pasted);
+  }
+
   async function retryFile(transferId: string) {
     setSendError(null);
     try {
@@ -531,7 +590,13 @@ export function MessengerPage() {
         )}
       </div>
 
-      <div className="conversation-panel">
+      <div
+        className={`conversation-panel${dropActive ? " drop-active" : ""}`}
+        onDragEnter={onFileDrag}
+        onDragOver={onFileDrag}
+        onDragLeave={onFileDragLeave}
+        onDrop={onFileDrop}
+      >
         {!chatId || (!peer && !group) ? (
           <div className="conversation-empty">
             <img src="/logo.png" alt="" className="conversation-empty-logo" />
@@ -583,6 +648,7 @@ export function MessengerPage() {
               ) : null}
             </div>
             <div className="messages-area" ref={messagesAreaRef} onScroll={onMessagesScroll}>
+              {dropActive && <div className="drop-hint">Отпустите, чтобы отправить файл</div>}
               {chatId && chatService.countMessages(chatId) > messages.length && (
                   <button type="button" className="secondary load-earlier" onClick={loadOlder}>
                     Более ранние сообщения
@@ -638,7 +704,7 @@ export function MessengerPage() {
                           <span className="msg-status-wrap">
                             {" "}
                             <DeliveryMark
-                              status={m.status}
+                              status={bubbleDeliveryStatus(m.status, transfer?.status)}
                               onRetry={
                                 m.status === MessageDeliveryStatus.Failed && m.contentType !== "file"
                                   ? () => void retryMessage(m.id)
@@ -658,8 +724,13 @@ export function MessengerPage() {
               <input
                 ref={fileInputRef}
                 type="file"
+                multiple
                 style={{ display: "none" }}
-                onChange={(e) => void onFileSelected(e.target.files?.[0] ?? null)}
+                onChange={(e) => {
+                  const picked = [...(e.target.files ?? [])];
+                  e.target.value = "";
+                  void sendFiles(picked);
+                }}
                 disabled={uploading || peer?.status === "blocked"}
               />
               <button
@@ -667,7 +738,7 @@ export function MessengerPage() {
                 className="secondary composer-icon-btn"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={uploading || peer?.status === "blocked"}
-                title="Прикрепить файл"
+                title="Прикрепить файл. Можно перетащить в чат или вставить из буфера"
               >
                 📎
               </button>
@@ -687,6 +758,7 @@ export function MessengerPage() {
                     void onSend(e);
                   }
                 }}
+                onPaste={onPasteFiles}
                 placeholder={
                   peer?.status === "blocked"
                     ? "Пользователь заблокирован"

@@ -1,3 +1,5 @@
+import type { ProtocolEnvelope } from "@lockal/shared";
+
 export interface FileMetaPayload {
   transferId: string;
   chatId: string;
@@ -30,4 +32,10 @@ export interface FileCompletePayload {
 export interface FileResumePayload {
   transferId: string;
   nextChunkIndex: number;
+}
+
+/** One hop through another online computer when the recipient is not reachable directly. */
+export interface FileRelayPayload {
+  targetDeviceIds: string[];
+  envelope: ProtocolEnvelope;
 }

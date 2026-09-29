@@ -24,6 +24,7 @@ import type {
   FileChunkPayload,
   FileCompletePayload,
   FileMetaPayload,
+  FileRelayPayload,
   FileResumePayload,
 } from "./payloads.js";
 import { TransferRepository } from "./transfer-repository.js";
@@ -38,9 +39,19 @@ export class FileTransferEngine {
   private readonly transfers: TransferRepository;
   private readonly chats: ChatService;
   private receiveBuffers = new Map<string, Blob[]>();
+  /** Chunks that arrived before file.meta created the transfer row. */
+  private earlyChunks = new Map<string, FileChunkPayload[]>();
   /** Transfers where every chunk reached at least one live peer. */
   private fullyDelivered = new Set<string>();
-  private static readonly MAX_CHUNK_ATTEMPTS = 8;
+  /** A chunk was dropped after retries. The file must not be shown as sent. */
+  private abandoned = new Set<string>();
+  /** Send loop still running. The periodic outbox flush must not mark it done. */
+  private sendingNow = new Set<string>();
+  /** Chunk indexes that already reached at least one other computer. */
+  private reachedChunks = new Map<string, Set<number>>();
+  /** Devices that did not accept a frame quickly. Later chunks skip them. */
+  private slowDevices = new Set<string>();
+  private static readonly MAX_CHUNK_ATTEMPTS = 30;
 
   constructor(
     private readonly db: DatabaseContext,
@@ -162,15 +173,16 @@ export class FileTransferEngine {
       sha256Hex: tr.sha256Hex,
       chunkSize: tr.chunkSize,
       totalChunks: tr.totalChunks,
-      group:
-        chat?.kind === "group"
-          ? {
-              title: chat.title ?? "Группа",
-              memberUserIds: this.chats.listMemberIds(tr.chatId),
-              rosterRevision: this.chats.rosterRevision(tr.chatId),
-            }
-          : undefined,
     };
+    // Only groups carry a roster. Setting `group: undefined` on a direct chat
+    // used to be signed and then stripped by JSON, so the peer rejected the file.
+    if (chat?.kind === "group") {
+      meta.group = {
+        title: chat.title ?? "Группа",
+        memberUserIds: this.chats.listMemberIds(tr.chatId),
+        rosterRevision: this.chats.rosterRevision(tr.chatId),
+      };
+    }
     const metaEnvelope = await this.signEnvelope("file.meta", meta);
     await this.broadcastToPeers(recipientUserId, metaEnvelope, (deviceId, env) => {
       this.transfers.enqueueChunkOutbox(transferId, -1, deviceId, JSON.stringify(env));
@@ -191,6 +203,9 @@ export class FileTransferEngine {
         break;
       case "file.resume":
         await this.handleResume(envelope.payload as FileResumePayload, envelope.senderDeviceId);
+        break;
+      case "file.relay":
+        await this.handleRelay(envelope.payload as FileRelayPayload);
         break;
       default:
         break;
@@ -261,6 +276,8 @@ export class FileTransferEngine {
     for (const item of pending) {
       if (item.attempts >= FileTransferEngine.MAX_CHUNK_ATTEMPTS) {
         this.transfers.markChunkGaveUp(item.id);
+        const reached = item.chunkIndex >= 0 && this.reachedChunks.get(item.transferId)?.has(item.chunkIndex);
+        if (item.chunkIndex >= 0 && !reached) this.abandoned.add(item.transferId);
         continue;
       }
       try {
@@ -270,6 +287,7 @@ export class FileTransferEngine {
           continue;
         }
         await this.transport.send(item.targetDeviceId, envelope);
+        this.slowDevices.delete(item.targetDeviceId);
         this.transfers.markChunkSent(item.id);
         if (item.chunkIndex >= 0) {
           const tr = this.transfers.get(item.transferId);
@@ -286,8 +304,21 @@ export class FileTransferEngine {
     for (const transferId of touched) {
       const tr = this.transfers.get(transferId);
       if (!tr || tr.status !== "sending") continue;
+      if (this.sendingNow.has(transferId)) continue;
       if (tr.nextChunkIndex < tr.totalChunks) continue;
       if (this.transfers.hasPendingOutbox(transferId)) continue;
+      if (this.abandoned.has(transferId)) {
+        this.transfers.setStatus(transferId, "failed");
+        this.fullyDelivered.delete(transferId);
+        this.abandoned.delete(transferId);
+        if (tr.messageId) {
+          this.db.connection.exec(
+            "UPDATE messages SET status = ? WHERE id = ? AND status = ?",
+            [MessageDeliveryStatus.Failed, tr.messageId, MessageDeliveryStatus.Sending],
+          );
+        }
+        continue;
+      }
       if (this.fullyDelivered.has(transferId) || this.transfers.hasSentChunk(transferId)) {
         this.markTransferSent(transferId, tr.messageId);
       } else {
@@ -325,6 +356,7 @@ export class FileTransferEngine {
   private markTransferSent(transferId: string, messageId: string | null): void {
     this.transfers.markCompleted(transferId);
     this.fullyDelivered.delete(transferId);
+    this.reachedChunks.delete(transferId);
     if (messageId) {
       this.db.connection.exec(
         "UPDATE messages SET status = ? WHERE id = ? AND status = ?",
@@ -408,11 +440,28 @@ export class FileTransferEngine {
       this.chats.touchChat(meta.chatId as never);
       this.transfers.linkAttachment(meta.messageId as never, meta.transferId, meta.transferId);
     }
+    const early = this.earlyChunks.get(meta.transferId) ?? [];
+    this.earlyChunks.delete(meta.transferId);
+    for (const chunk of early) {
+      await this.storeChunk(chunk);
+    }
   }
 
   private async handleChunk(chunk: FileChunkPayload): Promise<void> {
     const tr = this.transfers.get(chunk.transferId);
+    if (!tr) {
+      const queued = this.earlyChunks.get(chunk.transferId) ?? [];
+      queued.push(chunk);
+      this.earlyChunks.set(chunk.transferId, queued);
+      return;
+    }
+    await this.storeChunk(chunk);
+  }
+
+  private async storeChunk(chunk: FileChunkPayload): Promise<void> {
+    const tr = this.transfers.get(chunk.transferId);
     if (!tr) return;
+    if (chunk.chunkIndex < 0 || chunk.chunkIndex >= tr.totalChunks) return;
     const parts = this.receiveBuffers.get(chunk.transferId) ?? new Array(tr.totalChunks);
     const chunkBytes = Uint8Array.from(base64ToBytes(chunk.dataBase64));
     parts[chunk.chunkIndex] = new Blob([chunkBytes], { type: tr.mimeType });
@@ -480,31 +529,65 @@ export class FileTransferEngine {
     if (!tr) return;
     const sendingRange = fromIndex < tr.totalChunks;
     let live = sendingRange;
-    for (let i = fromIndex; i < tr.totalChunks; i++) {
-      const current = this.transfers.get(transferId);
-      if (!current || current.status === "paused" || current.status === "cancelled") return;
-      const dataBase64 = await readFileChunkBase64(file, i, tr.chunkSize);
-      const chunk: FileChunkPayload = { transferId, chunkIndex: i, dataBase64 };
-      const env = await this.signEnvelope("file.chunk", chunk);
-      const delivered = await this.broadcastToPeers(recipientUserId, env, (deviceId) => {
-        this.transfers.enqueueChunkOutbox(transferId, i, deviceId, "{}");
-      }, tr.chatId);
-      if (delivered === 0) live = false;
-      this.transfers.updateProgress(transferId, i + 1, "sending");
-    }
-    if (live) this.fullyDelivered.add(transferId);
-    await this.flushOutbox();
-    const finalStatus = this.transfers.get(transferId)?.status;
-    if (finalStatus === "paused" || finalStatus === "cancelled") return;
-    if (
-      this.fullyDelivered.has(transferId) ||
-      (!this.transfers.hasPendingOutbox(transferId) && this.transfers.hasSentChunk(transferId))
-    ) {
-      this.markTransferSent(transferId, tr.messageId);
+    this.sendingNow.add(transferId);
+    try {
+      for (let i = fromIndex; i < tr.totalChunks; i++) {
+        const current = this.transfers.get(transferId);
+        if (!current || current.status === "paused" || current.status === "cancelled") return;
+        const dataBase64 = await readFileChunkBase64(file, i, tr.chunkSize);
+        const chunk: FileChunkPayload = { transferId, chunkIndex: i, dataBase64 };
+        const env = await this.signEnvelope("file.chunk", chunk);
+        const delivered = await this.broadcastToPeers(
+          recipientUserId,
+          env,
+          (deviceId) => {
+            this.transfers.enqueueChunkOutbox(transferId, i, deviceId, "{}");
+          },
+          tr.chatId,
+        );
+        if (delivered === 0) live = false;
+        else {
+          const reached = this.reachedChunks.get(transferId) ?? new Set<number>();
+          reached.add(i);
+          this.reachedChunks.set(transferId, reached);
+        }
+        this.transfers.updateProgress(transferId, i + 1, "sending");
+        // Let chat and presence use the socket between chunks.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      this.sendingNow.delete(transferId);
+      if (live) this.fullyDelivered.add(transferId);
+      await this.flushOutbox();
+      const finalStatus = this.transfers.get(transferId)?.status;
+      if (
+        finalStatus === "paused" ||
+        finalStatus === "cancelled" ||
+        finalStatus === "failed" ||
+        finalStatus === "completed"
+      ) {
+        return;
+      }
+      if (this.abandoned.has(transferId)) return;
+      if (
+        this.fullyDelivered.has(transferId) ||
+        (!this.transfers.hasPendingOutbox(transferId) && this.transfers.hasSentChunk(transferId))
+      ) {
+        this.markTransferSent(transferId, tr.messageId);
+      }
+    } finally {
+      this.sendingNow.delete(transferId);
     }
   }
 
   private collectTargetDevices(recipientUserId: UserId, chatId?: string): DeviceId[] {
+    return this.collectTargets(recipientUserId, chatId).map((target) => target.deviceId);
+  }
+
+  /** Connected devices first, and the person we're writing to before our own other computers. */
+  private collectTargets(
+    recipientUserId: UserId,
+    chatId?: string,
+  ): Array<{ deviceId: DeviceId; userId: string; connected: boolean }> {
     const org = this.db.organizations.getFirst();
     if (!org) return [];
     const targetUserIds = new Set<string>([recipientUserId, this.ctx.userId]);
@@ -516,20 +599,91 @@ export class FileTransferEngine {
         targetUserIds.add(row.user_id);
       }
     }
-    const ids = new Set<string>();
+    const byDevice = new Map<string, string>();
     for (const d of this.db.devices.listByOrganization(org.id)) {
-      if (targetUserIds.has(d.userId) && d.id !== this.ctx.deviceId) ids.add(d.id);
+      if (targetUserIds.has(d.userId) && d.id !== this.ctx.deviceId) byDevice.set(d.id, d.userId);
     }
     for (const p of this.transport.getPeers()) {
-      if (p.userId && targetUserIds.has(p.userId) && p.deviceId !== this.ctx.deviceId) ids.add(p.deviceId);
+      if (p.userId && targetUserIds.has(p.userId) && p.deviceId !== this.ctx.deviceId) {
+        if (!byDevice.has(p.deviceId)) byDevice.set(p.deviceId, p.userId);
+      }
     }
     for (const row of this.db.connection.all<{ device_id: string; user_id: string }>(
       "SELECT device_id, user_id FROM known_peers WHERE organization_id = ?",
       [org.id],
     )) {
-      if (targetUserIds.has(row.user_id) && row.device_id !== this.ctx.deviceId) ids.add(row.device_id);
+      if (targetUserIds.has(row.user_id) && row.device_id !== this.ctx.deviceId && !byDevice.has(row.device_id)) {
+        byDevice.set(row.device_id, row.user_id);
+      }
     }
-    return [...ids] as DeviceId[];
+    const connected = new Set(
+      this.transport.getPeers().filter((peer) => peer.trusted).map((peer) => peer.deviceId),
+    );
+    const targets = [...byDevice.entries()].map(([deviceId, userId]) => ({
+      deviceId: deviceId as DeviceId,
+      userId,
+      connected: connected.has(deviceId),
+    }));
+    const rank = (userId: string) => (userId === recipientUserId ? 0 : userId === this.ctx.userId ? 2 : 1);
+    targets.sort((a, b) => {
+      if (a.connected !== b.connected) return a.connected ? -1 : 1;
+      return rank(a.userId) - rank(b.userId);
+    });
+    return targets;
+  }
+
+  private async sendToDevice(
+    deviceId: DeviceId,
+    envelope: ProtocolEnvelope,
+  ): Promise<"ok" | "fail"> {
+    try {
+      await this.transport.send(deviceId, envelope);
+      return "ok";
+    } catch {
+      return "fail";
+    }
+  }
+
+  /** Ask one other online computer to pass the frame on, when nobody in the chat accepted it. */
+  private async relayViaOtherPeer(
+    targetDeviceIds: DeviceId[],
+    envelope: ProtocolEnvelope,
+  ): Promise<boolean> {
+    if (envelope.messageType === "file.relay") return false;
+    if (targetDeviceIds.length === 0 || targetDeviceIds.length > 16) return false;
+    const taken = new Set<string>(targetDeviceIds);
+    const relay = this.transport.getPeers().find(
+      (peer) => peer.trusted && peer.deviceId !== this.ctx.deviceId && !taken.has(peer.deviceId),
+    );
+    if (!relay) return false;
+    const wrapper = await this.signEnvelope("file.relay", {
+      targetDeviceIds,
+      envelope,
+    } satisfies FileRelayPayload);
+    try {
+      await this.transport.send(relay.deviceId as DeviceId, wrapper);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async handleRelay(payload: FileRelayPayload): Promise<void> {
+    const inner = payload?.envelope;
+    const targets = Array.isArray(payload?.targetDeviceIds) ? payload.targetDeviceIds.slice(0, 16) : [];
+    if (!inner || targets.length === 0) return;
+    const kind = inner.messageType;
+    if (kind !== "file.meta" && kind !== "file.chunk" && kind !== "file.complete" && kind !== "file.resume") {
+      return;
+    }
+    for (const deviceId of targets) {
+      if (deviceId === this.ctx.deviceId) continue;
+      try {
+        await this.transport.send(deviceId as DeviceId, inner);
+      } catch {
+        /* the sender keeps a direct retry for this device */
+      }
+    }
   }
 
   private async broadcastToPeers(
@@ -538,8 +692,7 @@ export class FileTransferEngine {
     onQueue: (deviceId: DeviceId, env: ProtocolEnvelope) => void,
     chatId?: string,
   ): Promise<number> {
-    await this.transport.discoverPeers();
-    const targets = this.collectTargetDevices(recipientUserId, chatId);
+    const targets = this.collectTargets(recipientUserId, chatId);
     if (targets.length === 0) {
       const org = this.db.organizations.getFirst();
       if (org) {
@@ -549,14 +702,44 @@ export class FileTransferEngine {
       }
       return 0;
     }
+    const someoneConnected = targets.some((target) => target.connected);
+    const pool = someoneConnected ? targets.filter((target) => target.connected) : targets;
+    const deferred = someoneConnected ? targets.filter((target) => !target.connected) : [];
+    for (const target of deferred) onQueue(target.deviceId, envelope);
+
+    const ready = pool.filter((target) => !this.slowDevices.has(target.deviceId));
+    for (const target of pool) {
+      if (this.slowDevices.has(target.deviceId)) onQueue(target.deviceId, envelope);
+    }
+
     let delivered = 0;
-    for (const deviceId of targets) {
-      try {
-        await this.transport.send(deviceId, envelope);
-        delivered++;
-      } catch {
-        onQueue(deviceId, envelope);
-      }
+    let deliveredToOthers = 0;
+    await Promise.all(
+      ready.map(async (target) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), 800);
+        });
+        const outcome = await Promise.race([
+          this.sendToDevice(target.deviceId, envelope).finally(() => clearTimeout(timer)),
+          timeout,
+        ]);
+        if (outcome === "ok") {
+          delivered++;
+          if (target.userId !== this.ctx.userId) deliveredToOthers++;
+          return;
+        }
+        if (outcome === "timeout") this.slowDevices.add(target.deviceId);
+        onQueue(target.deviceId, envelope);
+      }),
+    );
+
+    if (deliveredToOthers === 0) {
+      const relayed = await this.relayViaOtherPeer(
+        targets.map((target) => target.deviceId),
+        envelope,
+      );
+      if (relayed) delivered++;
     }
     return delivered;
   }
